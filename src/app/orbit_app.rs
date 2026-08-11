@@ -364,12 +364,14 @@ impl OrbitApp {
     }
 
     fn paint_active_tab(&mut self, ui: &mut egui::Ui) -> egui::Response {
+        // Clone theme before mutably borrowing tabs to avoid borrow conflicts
+        let theme = self.theme.clone();
         let Some(tab) = self.active_tab_mut() else {
             let (_, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click());
             return response;
         };
 
-        tab.paint(ui, &self.theme)
+        tab.paint(ui, &theme)
     }
 
     fn run_action(&mut self, action: AppAction, ctx: &egui::Context) {
@@ -1264,7 +1266,7 @@ fn event_to_terminal_bytes(event: &egui::Event) -> Option<String> {
             ..
         } => {
             if modifiers.ctrl && !modifiers.shift {
-                return ctrl_key_sequence(key);
+            return ctrl_key_sequence(*key);
             }
 
             match key {
