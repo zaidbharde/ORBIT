@@ -34,6 +34,10 @@ struct OrbitApp {
     next_pane_id: usize,
     search_open: bool,
     history_open: bool,
+    // Theme
+    theme_name: String,
+    theme: crate::theme::Theme,
+    available_themes: Vec<&'static str>,
 }
 
 struct TerminalTab {
@@ -112,6 +116,21 @@ impl OrbitApp {
         let first_pane = TerminalPane::new(next_pane_id, &config, config.initial_grid);
         next_pane_id += 1;
 
+        let available_themes = crate::theme::get_theme_names();
+        // Theme preference: config.theme takes precedence, but allow ~/.orbit_theme override.
+        let mut theme_name = config.theme.clone();
+        if let Some(home) = std::env::var_os("HOME") {
+            let mut path = std::path::PathBuf::from(home);
+            path.push(".orbit_theme");
+            if let Ok(contents) = std::fs::read_to_string(path) {
+                let read = contents.trim();
+                if !read.is_empty() {
+                    theme_name = read.to_owned();
+                }
+            }
+        }
+        let theme = crate::theme::get_theme(&theme_name);
+
         Self {
             config,
             tabs: vec![TerminalTab {
@@ -125,6 +144,9 @@ impl OrbitApp {
             next_pane_id,
             search_open: false,
             history_open: false,
+            theme_name,
+            theme,
+            available_themes,
         }
     }
 
@@ -166,6 +188,27 @@ impl OrbitApp {
             if ui.button("F").on_hover_text("Search").clicked() {
                 self.search_open = !self.search_open;
             }
+
+            ui.separator();
+            // Theme selector
+            egui::ComboBox::from_label("Theme")
+                .selected_text(self.theme_name.clone())
+                .show_ui(ui, |ui| {
+                    for name in &self.available_themes {
+                        if ui.selectable_label(*name == self.theme_name, *name).clicked() {
+                            self.theme_name = name.to_string();
+                            self.theme = crate::theme::get_theme(&self.theme_name);
+                            // persist simple theme selection
+                            if let Some(home) = std::env::var_os("HOME") {
+                                let mut path = std::path::PathBuf::from(home);
+                                path.push(".orbit_theme");
+                                if let Ok(mut file) = std::fs::File::create(path) {
+                                    let _ = writeln!(file, "{}", self.theme_name);
+                                }
+                            }
+                        }
+                    }
+                });
         });
     }
 
@@ -739,11 +782,11 @@ impl TerminalPane {
 
         let painter = ui.painter_at(rect);
         let border = if is_active {
-            egui::Color32::from_rgb(120, 190, 255)
+            self.theme.ui.accent
         } else {
-            egui::Color32::from_rgb(32, 38, 44)
+            self.theme.ui.border
         };
-        painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(10, 12, 14));
+        painter.rect_filled(rect, 0.0, self.theme.ui.panel);
         painter.rect_stroke(
             rect,
             0.0,
@@ -752,8 +795,8 @@ impl TerminalPane {
         );
 
         let font_id = egui::FontId::monospace(14.0);
-        let text_color = egui::Color32::from_rgb(220, 225, 230);
-        let cursor_color = egui::Color32::from_rgb(120, 190, 255);
+        let text_color = self.theme.terminal.foreground;
+        let cursor_color = self.theme.terminal.cursor;
         let top_left = rect.left_top() + egui::vec2(10.0, 8.0);
         let rows = self.terminal.visible_rows();
 
@@ -816,7 +859,7 @@ impl TerminalPane {
             top_left + egui::vec2(left as f32 * CELL_WIDTH, row_index as f32 * CELL_HEIGHT),
             egui::vec2((right - left) as f32 * CELL_WIDTH, CELL_HEIGHT),
         );
-        painter.rect_filled(highlight, 0.0, egui::Color32::from_rgb(45, 75, 105));
+        painter.rect_filled(highlight, 0.0, self.theme.terminal.selection_bg);
     }
 
     fn paint_search_matches(
@@ -838,7 +881,7 @@ impl TerminalPane {
                     CELL_HEIGHT,
                 ),
             );
-            painter.rect_filled(highlight, 0.0, egui::Color32::from_rgb(95, 82, 32));
+            painter.rect_filled(highlight, 0.0, self.theme.terminal.search_highlight);
         }
     }
 

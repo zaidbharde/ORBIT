@@ -7,6 +7,7 @@ pub struct TerminalConfig {
     pub working_dir: PathBuf,
     pub initial_grid: TerminalGrid,
     pub scrollback_lines: usize,
+    pub theme: String,
 }
 
 impl Default for TerminalConfig {
@@ -16,6 +17,7 @@ impl Default for TerminalConfig {
             working_dir: default_working_dir(),
             initial_grid: TerminalGrid { rows: 24, cols: 80 },
             scrollback_lines: 10_000,
+            theme: "orbit-dark".to_owned(),
         }
     }
 }
