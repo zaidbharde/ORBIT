@@ -1,0 +1,11 @@
+[package]
+name = "orbit"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+crossbeam-channel = "0.5"
+eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+portable-pty = "0.9"
+vt100 = "0.16"
