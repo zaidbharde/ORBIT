@@ -218,17 +218,22 @@ impl OrbitApp {
         }
 
         let active_pane_id = self.active_tab().map(|tab| tab.active_pane);
+        let mut close_search = false;
         ui.horizontal(|ui| {
             ui.label("Search");
             if let Some(pane) = self.active_pane_mut() {
+                // avoid borrowing pane across UI input check that mutates self; use a local copy and assign back
+                let mut local_query = pane.search_query.clone();
                 let response = ui.add(
-                    egui::TextEdit::singleline(&mut pane.search_query)
+                    egui::TextEdit::singleline(&mut local_query)
                         .desired_width(240.0)
                         .hint_text("visible terminal text"),
                 );
-                if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape))
-                {
-                    self.search_open = false;
+                if response.changed() {
+                    pane.search_query = local_query.clone();
+                }
+                if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                    close_search = true;
                 }
                 let count = pane.search_match_count();
                 ui.label(format!("{count} visible matches"));
@@ -248,6 +253,10 @@ impl OrbitApp {
                 ui.label(format!("pane {id}"));
             }
         });
+
+        if close_search {
+            self.search_open = false;
+        }
     }
 
     fn ui_history_panel(&mut self, ctx: &egui::Context) {
@@ -262,10 +271,10 @@ impl OrbitApp {
                 ui.heading("Command History");
                 ui.separator();
 
-                let Some(tab) = self.active_tab() else {
+                let Some(tab) = self.active_tab_mut() else {
                     return;
                 };
-                let Some(pane) = tab.active_pane() else {
+                let Some(pane) = tab.active_pane_mut() else {
                     return;
                 };
 
@@ -345,7 +354,7 @@ impl OrbitApp {
             return response;
         };
 
-        tab.paint(ui)
+        tab.paint(ui, &self.theme)
     }
 
     fn run_action(&mut self, action: AppAction, ctx: &egui::Context) {
@@ -452,10 +461,11 @@ impl OrbitApp {
         let pane_id = self.next_pane_id;
         self.next_pane_id += 1;
 
+        let config = self.config.clone();
         let Some(tab) = self.active_tab_mut() else {
             return;
         };
-        tab.split_active(axis, pane_id, &self.config);
+        tab.split_active(axis, pane_id, &config);
     }
 
     fn close_active_pane(&mut self) {
@@ -519,9 +529,9 @@ impl TerminalTab {
         }
     }
 
-    fn paint(&mut self, ui: &mut egui::Ui) -> egui::Response {
+    fn paint(&mut self, ui: &mut egui::Ui, theme: &crate::theme::Theme) -> egui::Response {
         match &mut self.panes {
-            PaneLayout::Single(pane) => pane.paint(ui, self.active_pane == pane.id),
+            PaneLayout::Single(pane) => pane.paint(ui, self.active_pane == pane.id, theme),
             PaneLayout::Split {
                 axis,
                 first,
@@ -532,13 +542,13 @@ impl TerminalTab {
                     let half_height = (available.y - 6.0).max(0.0) / 2.0;
                     let first_response = ui
                         .allocate_ui(egui::vec2(available.x, half_height), |ui| {
-                            first.paint(ui, self.active_pane == first.id)
+                            first.paint(ui, self.active_pane == first.id, theme)
                         })
                         .inner;
                     ui.add_space(6.0);
                     let second_response = ui
                         .allocate_ui(ui.available_size(), |ui| {
-                            second.paint(ui, self.active_pane == second.id)
+                            second.paint(ui, self.active_pane == second.id, theme)
                         })
                         .inner;
 
@@ -562,13 +572,13 @@ impl TerminalTab {
                     ui.horizontal(|ui| {
                         let first_response = ui
                             .allocate_ui(egui::vec2(half_width, available.y), |ui| {
-                                first.paint(ui, self.active_pane == first.id)
+                                first.paint(ui, self.active_pane == first.id, theme)
                             })
                             .inner;
                         ui.add_space(6.0);
                         let second_response = ui
                             .allocate_ui(ui.available_size(), |ui| {
-                                second.paint(ui, self.active_pane == second.id)
+                                second.paint(ui, self.active_pane == second.id, theme)
                             })
                             .inner;
 
@@ -749,7 +759,7 @@ impl TerminalPane {
         }
     }
 
-    fn paint(&mut self, ui: &mut egui::Ui, is_active: bool) -> egui::Response {
+    fn paint(&mut self, ui: &mut egui::Ui, is_active: bool, theme: &crate::theme::Theme) -> egui::Response {
         let available = ui.available_size();
         self.resize_if_needed(available);
 
@@ -782,27 +792,27 @@ impl TerminalPane {
 
         let painter = ui.painter_at(rect);
         let border = if is_active {
-            self.theme.ui.accent
+            theme.ui.accent
         } else {
-            self.theme.ui.border
+            theme.ui.border
         };
-        painter.rect_filled(rect, 0.0, self.theme.ui.panel);
+        painter.rect_filled(rect, 0.0, theme.ui.panel);
         painter.rect_stroke(
             rect,
-            0.0,
-            egui::Stroke::new(1.0, border),
+            0.0_f32,
+            egui::Stroke::new(1.0_f32, border),
             egui::StrokeKind::Inside,
         );
 
         let font_id = egui::FontId::monospace(14.0);
-        let text_color = self.theme.terminal.foreground;
-        let cursor_color = self.theme.terminal.cursor;
+        let text_color = theme.terminal.foreground;
+        let cursor_color = theme.terminal.cursor;
         let top_left = rect.left_top() + egui::vec2(10.0, 8.0);
         let rows = self.terminal.visible_rows();
 
         for (row_index, line) in rows.iter().enumerate() {
-            self.paint_selection(&painter, top_left, row_index);
-            self.paint_search_matches(&painter, top_left, row_index, line);
+            self.paint_selection(&painter, top_left, row_index, theme);
+            self.paint_search_matches(&painter, top_left, row_index, line, theme);
             painter.text(
                 top_left + egui::vec2(0.0, row_index as f32 * CELL_HEIGHT),
                 egui::Align2::LEFT_TOP,
@@ -834,7 +844,7 @@ impl TerminalPane {
         response
     }
 
-    fn paint_selection(&self, painter: &egui::Painter, top_left: egui::Pos2, row_index: usize) {
+    fn paint_selection(&self, painter: &egui::Painter, top_left: egui::Pos2, row_index: usize, theme: &crate::theme::Theme) {
         let Some(selection) = self.selection else {
             return;
         };
@@ -859,7 +869,7 @@ impl TerminalPane {
             top_left + egui::vec2(left as f32 * CELL_WIDTH, row_index as f32 * CELL_HEIGHT),
             egui::vec2((right - left) as f32 * CELL_WIDTH, CELL_HEIGHT),
         );
-        painter.rect_filled(highlight, 0.0, self.theme.terminal.selection_bg);
+        painter.rect_filled(highlight, 0.0, theme.terminal.selection_bg);
     }
 
     fn paint_search_matches(
@@ -868,6 +878,7 @@ impl TerminalPane {
         top_left: egui::Pos2,
         row_index: usize,
         line: &str,
+        theme: &crate::theme::Theme,
     ) {
         if self.search_query.is_empty() {
             return;
@@ -881,7 +892,7 @@ impl TerminalPane {
                     CELL_HEIGHT,
                 ),
             );
-            painter.rect_filled(highlight, 0.0, self.theme.terminal.search_highlight);
+            painter.rect_filled(highlight, 0.0, theme.terminal.search_highlight);
         }
     }
 
@@ -1165,7 +1176,7 @@ fn action_from_event(event: &egui::Event) -> Option<AppAction> {
     // Non-Ctrl navigation keys
     if !modifiers.ctrl {
         // F3 -> Find next; Shift+F3 -> Find previous
-        if key == egui::Key::F3 {
+        if matches!(key, egui::Key::F3) {
             return if modifiers.shift {
                 Some(AppAction::FindPrevious)
             } else {
@@ -1225,7 +1236,7 @@ fn event_to_terminal_bytes(event: &egui::Event) -> Option<String> {
             ..
         } => {
             if modifiers.ctrl && !modifiers.shift {
-                return ctrl_key_sequence(*key);
+                return ctrl_key_sequence(key);
             }
 
             match key {
