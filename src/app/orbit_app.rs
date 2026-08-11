@@ -2,9 +2,9 @@ use crate::config::TerminalConfig;
 use crate::pty::{PtyCommand, PtySession};
 use crate::terminal::{TerminalGrid, TerminalState};
 use eframe::egui;
-use std::time::{Duration, SystemTime};
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::time::{Duration, SystemTime};
 
 const CELL_WIDTH: f32 = 8.5;
 const CELL_HEIGHT: f32 = 18.0;
@@ -195,7 +195,10 @@ impl OrbitApp {
                 .selected_text(self.theme_name.clone())
                 .show_ui(ui, |ui| {
                     for name in &self.available_themes {
-                        if ui.selectable_label(*name == self.theme_name, *name).clicked() {
+                        if ui
+                            .selectable_label(*name == self.theme_name, *name)
+                            .clicked()
+                        {
                             self.theme_name = name.to_string();
                             self.theme = crate::theme::get_theme(&self.theme_name);
                             // persist simple theme selection
@@ -240,7 +243,11 @@ impl OrbitApp {
                 if ui.button("Next").on_hover_text("Find next (F3)").clicked() {
                     pane.find_next_match();
                 }
-                if ui.button("Prev").on_hover_text("Find previous (Shift+F3)").clicked() {
+                if ui
+                    .button("Prev")
+                    .on_hover_text("Find previous (Shift+F3)")
+                    .clicked()
+                {
                     pane.find_previous_match();
                 }
             }
@@ -281,7 +288,9 @@ impl OrbitApp {
                 // Filter input for history
                 ui.horizontal(|ui| {
                     ui.label("Filter:");
-                    ui.add(egui::TextEdit::singleline(&mut pane.history_filter).desired_width(160.0));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut pane.history_filter).desired_width(160.0),
+                    );
                     if ui.button("Clear").clicked() {
                         pane.history_filter.clear();
                     }
@@ -293,13 +302,19 @@ impl OrbitApp {
                 }
 
                 let filter = pane.history_filter.to_lowercase();
-                for entry in pane.history.iter().rev().filter(|e| {
-                    if filter.is_empty() {
-                        true
-                    } else {
-                        e.text.to_lowercase().contains(&filter)
-                    }
-                }).take(100) {
+                for entry in pane
+                    .history
+                    .iter()
+                    .rev()
+                    .filter(|e| {
+                        if filter.is_empty() {
+                            true
+                        } else {
+                            e.text.to_lowercase().contains(&filter)
+                        }
+                    })
+                    .take(100)
+                {
                     let age = entry
                         .submitted_at
                         .elapsed()
@@ -747,8 +762,9 @@ impl TerminalPane {
                 PtyCommand::Output(bytes) => self.terminal.process(&bytes),
                 PtyCommand::Exited(status) => {
                     self.exited = true;
-                    let message =
-                        format!("\r\n[ORBIT] shell exited: {status}. Press Ctrl+Shift+R to restart.\r\n");
+                    let message = format!(
+                        "\r\n[ORBIT] shell exited: {status}. Press Ctrl+Shift+R to restart.\r\n"
+                    );
                     self.terminal.process(message.as_bytes());
                 }
                 PtyCommand::Error(error) => {
@@ -759,7 +775,12 @@ impl TerminalPane {
         }
     }
 
-    fn paint(&mut self, ui: &mut egui::Ui, is_active: bool, theme: &crate::theme::Theme) -> egui::Response {
+    fn paint(
+        &mut self,
+        ui: &mut egui::Ui,
+        is_active: bool,
+        theme: &crate::theme::Theme,
+    ) -> egui::Response {
         let available = ui.available_size();
         self.resize_if_needed(available);
 
@@ -844,7 +865,13 @@ impl TerminalPane {
         response
     }
 
-    fn paint_selection(&self, painter: &egui::Painter, top_left: egui::Pos2, row_index: usize, theme: &crate::theme::Theme) {
+    fn paint_selection(
+        &self,
+        painter: &egui::Painter,
+        top_left: egui::Pos2,
+        row_index: usize,
+        theme: &crate::theme::Theme,
+    ) {
         let Some(selection) = self.selection else {
             return;
         };
@@ -977,7 +1004,9 @@ impl TerminalPane {
                 for character in text.chars() {
                     match character {
                         '\r' | '\n' => self.submit_current_command(),
-                        character if !character.is_control() => self.current_command.push(character),
+                        character if !character.is_control() => {
+                            self.current_command.push(character)
+                        }
                         _ => {}
                     }
                 }
@@ -1023,8 +1052,7 @@ impl TerminalPane {
                 if let Some(home) = std::env::var_os("HOME") {
                     let mut path = std::path::PathBuf::from(home);
                     path.push(".orbit_history");
-                    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path)
-                    {
+                    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
                         let _ = writeln!(file, "{}", command);
                     }
                 }
