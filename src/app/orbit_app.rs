@@ -32,6 +32,7 @@ struct OrbitApp {
     next_pane_id: usize,
     search_open: bool,
     history_open: bool,
+    typography_dirty: bool,
     // Theme
     theme_name: String,
     theme: crate::theme::Theme,
@@ -129,7 +130,7 @@ impl OrbitApp {
         }
         let theme = crate::theme::get_theme(&theme_name);
 
-        let app = Self {
+        let mut app = Self {
             config,
             tabs: vec![TerminalTab {
                 id: 1,
@@ -142,11 +143,13 @@ impl OrbitApp {
             next_pane_id,
             search_open: false,
             history_open: false,
+            typography_dirty: true,
             theme_name,
             theme,
             available_themes,
         };
         app.apply_typography(&creation.egui_ctx);
+        app.typography_dirty = false;
         app
     }
 
@@ -221,17 +224,22 @@ impl OrbitApp {
                     for name in &font_names {
                         if ui.selectable_label(name == &selected_font, name).clicked() {
                             self.config.typography.terminal_font = name.clone();
+                            self.typography_dirty = true;
                             self.persist_config();
-                            ui.ctx().set_fonts(egui::FontDefinitions::default());
-                            self.apply_typography(ui.ctx());
                         }
                     }
                 });
 
-            ui.add(
-                egui::Slider::new(&mut self.config.typography.terminal_font_size, 8.0..=32.0)
-                    .text("Terminal size"),
-            );
+            if ui
+                .add(
+                    egui::Slider::new(&mut self.config.typography.terminal_font_size, 8.0..=32.0)
+                        .text("Terminal size"),
+                )
+                .changed()
+            {
+                self.typography_dirty = true;
+                self.persist_config();
+            }
             if ui
                 .add(
                     egui::Slider::new(&mut self.config.typography.line_spacing, 0.0..=12.0)
@@ -239,6 +247,7 @@ impl OrbitApp {
                 )
                 .changed()
             {
+                self.typography_dirty = true;
                 self.persist_config();
             }
             if ui
@@ -248,6 +257,7 @@ impl OrbitApp {
                 )
                 .changed()
             {
+                self.typography_dirty = true;
                 self.persist_config();
             }
             if ui
@@ -257,8 +267,8 @@ impl OrbitApp {
                 )
                 .changed()
             {
+                self.typography_dirty = true;
                 self.persist_config();
-                self.apply_typography(ui.ctx());
             }
         });
     }
@@ -1297,7 +1307,10 @@ impl Selection {
 impl eframe::App for OrbitApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_pty();
-        self.apply_typography(ctx);
+        if self.typography_dirty {
+            self.apply_typography(ctx);
+            self.typography_dirty = false;
+        }
 
         egui::TopBottomPanel::top("orbit_tabs").show(ctx, |ui| {
             self.ui_top_bar(ui);
