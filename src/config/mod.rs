@@ -17,7 +17,7 @@ pub struct TypographyConfig {
 impl Default for TypographyConfig {
     fn default() -> Self {
         Self {
-            terminal_font: default_system_monospace_font(),
+            terminal_font: "monospace".to_owned(),
             terminal_font_size: 14.0,
             line_spacing: 0.0,
             character_spacing: 0.0,
@@ -52,12 +52,12 @@ impl TypographyConfig {
 
     pub fn resolved_terminal_font_name(&self) -> String {
         let trimmed = self.terminal_font.trim();
-        if !trimmed.is_empty() && self.font_file_for(trimmed).is_some() {
+        if !trimmed.is_empty() && font_file_for_family(trimmed).is_some() {
             return trimmed.to_owned();
         }
 
         let fallback = default_system_monospace_font();
-        if self.font_file_for(&fallback).is_some() {
+        if font_file_for_family(&fallback).is_some() {
             fallback
         } else {
             "monospace".to_owned()
@@ -91,55 +91,62 @@ impl TypographyConfig {
             return;
         }
 
-        if let Some(file) = self.font_file_for(&family) {
+        if let Some(file) = font_file_for_family(&family) {
             let bytes = match fs::read(file) {
                 Ok(bytes) => bytes,
                 Err(_) => return,
             };
-            let key = "orbit-terminal-font";
+
+            let key = format!("orbit-terminal-font-{}", family.replace(' ', "_"));
             fonts.font_data.insert(
-                key.to_owned(),
+                key.clone(),
                 std::sync::Arc::new(egui::FontData::from_owned(bytes)),
             );
+
+            let custom_family = egui::FontFamily::Name(family.clone().into());
+            let custom = fonts.families.entry(custom_family).or_default();
+            if !custom.iter().any(|name| name == &key) {
+                custom.insert(0, key.clone());
+            }
+
             let monospace = fonts
                 .families
                 .entry(egui::FontFamily::Monospace)
                 .or_default();
-            if !monospace.iter().any(|name| name == key) {
-                monospace.insert(0, key.to_owned());
+            if !monospace.iter().any(|name| name == &key) {
+                monospace.insert(0, key);
             }
         }
     }
+}
 
-    fn font_file_for(&self, family: &str) -> Option<PathBuf> {
-        let trimmed = family.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
+fn font_file_for_family(family: &str) -> Option<PathBuf> {
+    let trimmed = family.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
 
-        let expected = family_name_variants(trimmed);
-        for candidate in expected {
-            if let Ok(output) = std::process::Command::new("fc-match")
-                .args(["--format=%{file}\n", &candidate])
-                .output()
-            {
-                if output.status.success() {
-                    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-                    if !value.is_empty() {
-                        let path = PathBuf::from(value);
-                        if path.exists() {
-                            return Some(path);
-                        }
+    let expected = family_name_variants(trimmed);
+    for candidate in expected {
+        if let Ok(output) = std::process::Command::new("fc-match")
+            .args(["--format=%{file}\n", &candidate])
+            .output()
+        {
+            if output.status.success() {
+                let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                if !value.is_empty() {
+                    let path = PathBuf::from(value);
+                    if path.exists() {
+                        return Some(path);
                     }
                 }
             }
-            let path = find_font_in_standard_directories(&candidate);
-            if path.is_some() {
-                return path;
-            }
         }
-        None
+        if let Some(path) = find_font_in_standard_directories(&candidate) {
+            return Some(path);
+        }
     }
+    None
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -216,10 +223,7 @@ fn config_path() -> PathBuf {
 
 fn default_system_monospace_font() -> String {
     for candidate in TypographyConfig::system_font_candidates() {
-        if TypographyConfig::default()
-            .font_file_for(&candidate)
-            .is_some()
-        {
+        if font_file_for_family(&candidate).is_some() {
             return candidate;
         }
     }
@@ -269,7 +273,8 @@ fn find_font_in_standard_directories(family: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{TerminalConfig, TypographyConfig};
+    use super::{default_system_monospace_font, TerminalConfig, TypographyConfig};
+    use eframe::egui;
 
     #[test]
     fn typography_defaults_are_sane() {
@@ -287,5 +292,31 @@ mod tests {
         let fallback = config.resolved_terminal_font_name();
         assert!(!fallback.trim().is_empty());
         assert_ne!(fallback, "Definitely Not A Real Font Name 123");
+    }
+
+    #[test]
+    fn custom_terminal_font_is_bound_in_egui_font_definitions() {
+        let family = default_system_monospace_font();
+        if family == "monospace" {
+            return;
+        }
+
+        let config = TypographyConfig {
+            terminal_font: family.clone(),
+            terminal_font_size: 14.0,
+            line_spacing: 0.0,
+            character_spacing: 0.0,
+            ui_font_size: 14.0,
+        };
+
+        let mut fonts = egui::FontDefinitions::default();
+        config.install_for_egui(&mut fonts);
+
+        assert!(
+            fonts
+                .families
+                .contains_key(&egui::FontFamily::Name(family.clone().into())),
+            "custom font family {family:?} should be bound for egui"
+        );
     }
 }
