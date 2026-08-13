@@ -64,17 +64,8 @@ impl TypographyConfig {
         }
     }
 
-    pub fn terminal_font_family(&self) -> egui::FontFamily {
-        let font_name = self.resolved_terminal_font_name();
-        if font_name == "monospace" {
-            egui::FontFamily::Monospace
-        } else {
-            egui::FontFamily::Name(font_name.into())
-        }
-    }
-
     pub fn terminal_font_id(&self) -> egui::FontId {
-        egui::FontId::new(self.terminal_font_size, self.terminal_font_family())
+        egui::FontId::new(self.terminal_font_size, egui::FontFamily::Monospace)
     }
 
     pub fn cell_width(&self) -> f32 {
@@ -273,7 +264,7 @@ fn find_font_in_standard_directories(family: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_system_monospace_font, TerminalConfig, TypographyConfig};
+    use super::{TerminalConfig, TypographyConfig, default_system_monospace_font};
     use eframe::egui;
 
     #[test]

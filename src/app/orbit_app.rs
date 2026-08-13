@@ -4,6 +4,7 @@ use crate::terminal::{TerminalGrid, TerminalState};
 use eframe::egui;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::{Duration, SystemTime};
 
 const MAX_SCROLLBACK_OFFSET: usize = 10_000;
@@ -33,6 +34,7 @@ struct OrbitApp {
     search_open: bool,
     history_open: bool,
     typography_dirty: bool,
+    theme_dirty: bool,
     // Theme
     theme_name: String,
     theme: crate::theme::Theme,
@@ -144,12 +146,15 @@ impl OrbitApp {
             search_open: false,
             history_open: false,
             typography_dirty: true,
+            theme_dirty: true,
             theme_name,
             theme,
             available_themes,
         };
         app.apply_typography(&creation.egui_ctx);
+        app.apply_theme(&creation.egui_ctx);
         app.typography_dirty = false;
+        app.theme_dirty = false;
         app
     }
 
@@ -172,7 +177,20 @@ impl OrbitApp {
             for index in 0..self.tabs.len() {
                 let selected = index == self.active_tab;
                 let title = self.tabs[index].title.clone();
-                if ui.selectable_label(selected, title).clicked() {
+                let fill = if selected {
+                    self.theme.ui.tab_active
+                } else {
+                    self.theme.ui.tab_inactive
+                };
+                let text_color = if selected {
+                    self.theme.ui.text
+                } else {
+                    self.theme.ui.secondary_text
+                };
+                let tab_button = egui::Button::new(egui::RichText::new(title).color(text_color))
+                    .fill(fill)
+                    .stroke(egui::Stroke::new(1.0_f32, self.theme.ui.divider));
+                if ui.add(tab_button).clicked() {
                     self.active_tab = index;
                 }
             }
@@ -203,6 +221,9 @@ impl OrbitApp {
                         {
                             self.theme_name = name.to_string();
                             self.theme = crate::theme::get_theme(&self.theme_name);
+                            self.config.theme = self.theme_name.clone();
+                            self.theme_dirty = true;
+                            self.persist_config();
                             if let Some(home) = std::env::var_os("HOME") {
                                 let mut path = std::path::PathBuf::from(home);
                                 path.push(".orbit_theme");
@@ -212,6 +233,13 @@ impl OrbitApp {
                             }
                         }
                     }
+
+                    ui.separator();
+                    let (status_text, status_color) = self.active_status_label();
+                    ui.colored_label(status_color, status_text);
+                    ui.label(
+                        egui::RichText::new(self.theme.name).color(self.theme.ui.secondary_text),
+                    );
                 });
 
             ui.separator();
@@ -332,6 +360,7 @@ impl OrbitApp {
         egui::SidePanel::right("orbit_history")
             .resizable(true)
             .default_width(280.0)
+            .frame(egui::Frame::new().fill(self.theme.ui.panel))
             .show(ctx, |ui| {
                 ui.heading("Command History");
                 ui.separator();
@@ -433,38 +462,96 @@ impl OrbitApp {
         tab.paint(ui, &theme, &typography)
     }
 
-    fn apply_typography(&self, ctx: &egui::Context) {
-        let mut fonts = egui::FontDefinitions::default();
-        self.config.typography.install_for_egui(&mut fonts);
-        ctx.set_fonts(fonts);
+    fn active_status_label(&self) -> (String, egui::Color32) {
+        match self.active_tab() {
+            Some(tab) => match tab.active_pane() {
+                Some(pane) if pane.exited => ("shell exited".to_owned(), self.theme.status.error),
+                Some(pane) if pane.pty.is_err() => {
+                    ("pty error".to_owned(), self.theme.status.error)
+                }
+                Some(_) => ("running".to_owned(), self.theme.status.success),
+                None => ("no active pane".to_owned(), self.theme.status.warning),
+            },
+            None => ("no tabs".to_owned(), self.theme.status.warning),
+        }
+    }
 
-        ctx.all_styles_mut(|style| {
-            style.text_styles.insert(
-                egui::TextStyle::Body,
-                egui::FontId::new(
-                    self.config.typography.ui_font_size,
-                    egui::FontFamily::Proportional,
-                ),
-            );
-            style.text_styles.insert(
-                egui::TextStyle::Monospace,
-                self.config.typography.terminal_font_id(),
-            );
-            style.text_styles.insert(
-                egui::TextStyle::Button,
-                egui::FontId::new(
-                    self.config.typography.ui_font_size,
-                    egui::FontFamily::Proportional,
-                ),
-            );
-            style.text_styles.insert(
-                egui::TextStyle::Small,
-                egui::FontId::new(
-                    (self.config.typography.ui_font_size - 1.0).max(8.0),
-                    egui::FontFamily::Proportional,
-                ),
-            );
+    fn apply_theme(&self, ctx: &egui::Context) {
+        let theme = self.theme.clone();
+        ctx.style_mut(|style| {
+            style.visuals = if is_light_color(theme.ui.background) {
+                egui::Visuals::light()
+            } else {
+                egui::Visuals::dark()
+            };
+
+            style.visuals.window_fill = theme.ui.background;
+            style.visuals.panel_fill = theme.ui.panel;
+            style.visuals.extreme_bg_color = theme.ui.background;
+            style.visuals.faint_bg_color = theme.ui.panel;
+            style.visuals.code_bg_color = theme.ui.panel;
+            style.visuals.override_text_color = Some(theme.ui.text);
+            style.visuals.hyperlink_color = theme.ui.accent;
+            style.visuals.selection.bg_fill = theme.terminal.selection_bg;
+            style.visuals.selection.stroke.color = theme
+                .terminal
+                .selection_fg
+                .unwrap_or(theme.terminal.foreground);
+
+            style.visuals.widgets.noninteractive.bg_fill = theme.ui.background;
+            style.visuals.widgets.noninteractive.fg_stroke.color = theme.ui.divider;
+            style.visuals.widgets.noninteractive.bg_stroke.color = theme.ui.divider;
+
+            style.visuals.widgets.inactive.bg_fill = theme.ui.tab_inactive;
+            style.visuals.widgets.inactive.fg_stroke.color = theme.ui.secondary_text;
+            style.visuals.widgets.inactive.bg_stroke.color = theme.ui.divider;
+
+            style.visuals.widgets.hovered.bg_fill = theme.ui.tab_active;
+            style.visuals.widgets.hovered.fg_stroke.color = theme.ui.text;
+            style.visuals.widgets.hovered.bg_stroke.color = theme.ui.accent;
+
+            style.visuals.widgets.active.bg_fill = theme.ui.tab_active;
+            style.visuals.widgets.active.fg_stroke.color = theme.ui.text;
+            style.visuals.widgets.active.bg_stroke.color = theme.ui.accent;
+
+            style.visuals.window_stroke.color = theme.ui.border;
+            style.visuals.window_stroke.width = 1.0;
         });
+    }
+
+    fn apply_typography(&self, ctx: &egui::Context) {
+        let typography = self.config.typography.clone();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let mut fonts = egui::FontDefinitions::default();
+            typography.install_for_egui(&mut fonts);
+            ctx.set_fonts(fonts);
+
+            ctx.all_styles_mut(|style| {
+                style.text_styles.insert(
+                    egui::TextStyle::Body,
+                    egui::FontId::new(typography.ui_font_size, egui::FontFamily::Proportional),
+                );
+                style.text_styles.insert(
+                    egui::TextStyle::Monospace,
+                    egui::FontId::new(typography.terminal_font_size, egui::FontFamily::Monospace),
+                );
+                style.text_styles.insert(
+                    egui::TextStyle::Button,
+                    egui::FontId::new(typography.ui_font_size, egui::FontFamily::Proportional),
+                );
+                style.text_styles.insert(
+                    egui::TextStyle::Small,
+                    egui::FontId::new(
+                        (typography.ui_font_size - 1.0).max(8.0),
+                        egui::FontFamily::Proportional,
+                    ),
+                );
+            });
+        }));
+
+        if result.is_err() {
+            eprintln!("[ORBIT] failed to apply typography change; keeping the previous font setup");
+        }
     }
 
     fn persist_config(&self) {
@@ -926,7 +1013,7 @@ impl TerminalPane {
         } else {
             theme.ui.border
         };
-        painter.rect_filled(rect, 0.0, theme.ui.panel);
+        painter.rect_filled(rect, 0.0, theme.terminal.background);
         painter.rect_stroke(
             rect,
             0.0_f32,
@@ -935,120 +1022,105 @@ impl TerminalPane {
         );
 
         let font_id = typography.terminal_font_id();
-        let text_color = theme.terminal.foreground;
-        let cursor_color = theme.terminal.cursor;
         let top_left = rect.left_top() + egui::vec2(10.0, 8.0);
         let rows = self.terminal.visible_rows();
+        let selection = self.selection.map(|selection| selection.normalized());
+        let search_query = self.search_query.clone();
+        let search_len = search_query.chars().count();
 
         for (row_index, line) in rows.iter().enumerate() {
-            self.paint_selection(
-                &painter,
-                top_left,
-                row_index,
-                theme,
-                cell_width,
-                cell_height,
-            );
-            self.paint_search_matches(
-                &painter,
-                top_left,
-                row_index,
-                line,
-                theme,
-                cell_width,
-                cell_height,
-            );
-            painter.text(
-                top_left + egui::vec2(0.0, row_index as f32 * cell_height),
-                egui::Align2::LEFT_TOP,
-                line,
-                font_id.clone(),
-                text_color,
-            );
-        }
+            let search_matches = if search_query.is_empty() {
+                Vec::new()
+            } else {
+                match_columns(line, &search_query)
+            };
 
-        let (cursor_row, cursor_col) = self.terminal.cursor_position();
-        if response.has_focus() && is_active {
-            let cursor_min = top_left
-                + egui::vec2(
-                    cursor_col as f32 * cell_width,
-                    cursor_row as f32 * cell_height,
+            for col in 0..self.last_grid.cols as usize {
+                let Some(cell) = self.terminal.cell(row_index as u16, col as u16) else {
+                    continue;
+                };
+
+                if cell.is_wide_continuation() {
+                    continue;
+                }
+
+                let width = if cell.is_wide() { 2.0 } else { 1.0 };
+                let cell_rect = egui::Rect::from_min_size(
+                    top_left + egui::vec2(col as f32 * cell_width, row_index as f32 * cell_height),
+                    egui::vec2(cell_width * width, cell_height),
                 );
-            let cursor_rect = egui::Rect::from_min_size(
-                cursor_min,
-                egui::vec2(cell_width.max(1.0), cell_height.max(1.0)),
-            );
-            painter.rect_stroke(
-                cursor_rect,
-                0.0,
-                egui::Stroke::new(1.0_f32, cursor_color),
-                egui::StrokeKind::Inside,
-            );
+
+                let selected = selection.is_some_and(|(start, end)| {
+                    row_index >= start.0
+                        && row_index <= end.0
+                        && col >= if row_index == start.0 { start.1 } else { 0 }
+                        && col
+                            < if row_index == end.0 {
+                                end.1
+                            } else {
+                                self.last_grid.cols as usize
+                            }
+                });
+                let searched = !selected
+                    && search_len > 0
+                    && search_matches
+                        .iter()
+                        .any(|start| col >= *start && col < *start + search_len);
+
+                let fg = if selected {
+                    theme
+                        .terminal
+                        .selection_fg
+                        .unwrap_or(theme.terminal.foreground)
+                } else {
+                    color_from_vt100(theme.terminal.foreground, cell.fgcolor(), theme)
+                };
+                let bg = if selected {
+                    theme.terminal.selection_bg
+                } else if searched {
+                    theme.terminal.search_highlight
+                } else {
+                    color_from_vt100(theme.terminal.background, cell.bgcolor(), theme)
+                };
+
+                if bg != theme.terminal.background {
+                    painter.rect_filled(cell_rect, 0.0, bg);
+                }
+
+                if cell.has_contents() {
+                    painter.text(
+                        cell_rect.left_top(),
+                        egui::Align2::LEFT_TOP,
+                        cell.contents(),
+                        font_id.clone(),
+                        fg,
+                    );
+                }
+            }
+
+            if response.has_focus() && is_active {
+                let (cursor_row, cursor_col) = self.terminal.cursor_position();
+                if cursor_row as usize == row_index {
+                    let cursor_min = top_left
+                        + egui::vec2(
+                            cursor_col as f32 * cell_width,
+                            cursor_row as f32 * cell_height,
+                        );
+                    let cursor_rect = egui::Rect::from_min_size(
+                        cursor_min,
+                        egui::vec2(cell_width.max(1.0), cell_height.max(1.0)),
+                    );
+                    painter.rect_stroke(
+                        cursor_rect,
+                        0.0,
+                        egui::Stroke::new(1.0_f32, theme.terminal.cursor),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+            }
         }
 
         response
-    }
-
-    fn paint_selection(
-        &self,
-        painter: &egui::Painter,
-        top_left: egui::Pos2,
-        row_index: usize,
-        theme: &crate::theme::Theme,
-        cell_width: f32,
-        cell_height: f32,
-    ) {
-        let Some(selection) = self.selection else {
-            return;
-        };
-
-        let (start, end) = selection.normalized();
-        if row_index < start.0 || row_index > end.0 {
-            return;
-        }
-
-        let left = if row_index == start.0 { start.1 } else { 0 };
-        let right = if row_index == end.0 {
-            end.1
-        } else {
-            self.last_grid.cols as usize
-        };
-
-        if right <= left {
-            return;
-        }
-
-        let highlight = egui::Rect::from_min_size(
-            top_left + egui::vec2(left as f32 * cell_width, row_index as f32 * cell_height),
-            egui::vec2((right - left) as f32 * cell_width, cell_height),
-        );
-        painter.rect_filled(highlight, 0.0, theme.terminal.selection_bg);
-    }
-
-    fn paint_search_matches(
-        &self,
-        painter: &egui::Painter,
-        top_left: egui::Pos2,
-        row_index: usize,
-        line: &str,
-        theme: &crate::theme::Theme,
-        cell_width: f32,
-        cell_height: f32,
-    ) {
-        if self.search_query.is_empty() {
-            return;
-        }
-
-        for column in match_columns(line, &self.search_query) {
-            let highlight = egui::Rect::from_min_size(
-                top_left + egui::vec2(column as f32 * cell_width, row_index as f32 * cell_height),
-                egui::vec2(
-                    self.search_query.chars().count() as f32 * cell_width,
-                    cell_height,
-                ),
-            );
-            painter.rect_filled(highlight, 0.0, theme.terminal.search_highlight);
-        }
     }
 
     fn resize_if_needed(&mut self, available: egui::Vec2, typography: &TypographyConfig) {
@@ -1307,19 +1379,27 @@ impl Selection {
 impl eframe::App for OrbitApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_pty();
+
+        egui::TopBottomPanel::top("orbit_tabs")
+            .frame(egui::Frame::new().fill(self.theme.ui.panel))
+            .show(ctx, |ui| {
+                self.ui_top_bar(ui);
+                self.ui_search_bar(ui);
+            });
+
+        if self.theme_dirty {
+            self.apply_theme(ctx);
+            self.theme_dirty = false;
+        }
         if self.typography_dirty {
             self.apply_typography(ctx);
             self.typography_dirty = false;
         }
 
-        egui::TopBottomPanel::top("orbit_tabs").show(ctx, |ui| {
-            self.ui_top_bar(ui);
-            self.ui_search_bar(ui);
-        });
         self.ui_history_panel(ctx);
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE)
+            .frame(egui::Frame::new().fill(self.theme.ui.background))
             .show(ctx, |ui| {
                 let response = self.paint_active_tab(ui);
                 self.handle_keyboard(ctx, response.has_focus());
@@ -1477,6 +1557,25 @@ fn match_columns(line: &str, query: &str) -> Vec<usize> {
         .match_indices(&query_lower)
         .map(|(byte_index, _)| line[..byte_index].chars().count())
         .collect()
+}
+
+fn color_from_vt100(
+    default_color: egui::Color32,
+    color: vt100::Color,
+    theme: &crate::theme::Theme,
+) -> egui::Color32 {
+    match color {
+        vt100::Color::Default => default_color,
+        vt100::Color::Idx(index) => theme.terminal.ansi[index as usize],
+        vt100::Color::Rgb(red, green, blue) => egui::Color32::from_rgb(red, green, blue),
+    }
+}
+
+fn is_light_color(color: egui::Color32) -> bool {
+    let red = color.r() as u32;
+    let green = color.g() as u32;
+    let blue = color.b() as u32;
+    (red * 299 + green * 587 + blue * 114) >= 128_000
 }
 
 fn format_age(duration: Duration) -> String {

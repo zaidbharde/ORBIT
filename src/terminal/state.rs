@@ -41,4 +41,8 @@ impl TerminalState {
         let col = screen.cursor_position().1.min(cols.saturating_sub(1));
         (row, col)
     }
+
+    pub fn cell(&self, row: u16, col: u16) -> Option<&vt100::Cell> {
+        self.parser.screen().cell(row, col)
+    }
 }
