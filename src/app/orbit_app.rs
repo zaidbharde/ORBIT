@@ -1028,6 +1028,15 @@ impl TerminalPane {
         let search_query = self.search_query.clone();
         let search_len = search_query.chars().count();
 
+        // The cursor is only meaningful on the live screen. When scrolled back
+        // the grid offsets no longer line up with `cursor_position()`, and the
+        // terminal may have hidden the cursor via an escape sequence.
+        let cursor_visible = response.has_focus()
+            && is_active
+            && !self.terminal.cursor_hidden()
+            && self.terminal.scrollback() == 0;
+        let (cursor_row, cursor_col) = self.terminal.cursor_position();
+
         for (row_index, line) in rows.iter().enumerate() {
             let search_matches = if search_query.is_empty() {
                 Vec::new()
@@ -1097,27 +1106,24 @@ impl TerminalPane {
                     );
                 }
             }
+        }
 
-            if response.has_focus() && is_active {
-                let (cursor_row, cursor_col) = self.terminal.cursor_position();
-                if cursor_row as usize == row_index {
-                    let cursor_min = top_left
-                        + egui::vec2(
-                            cursor_col as f32 * cell_width,
-                            cursor_row as f32 * cell_height,
-                        );
-                    let cursor_rect = egui::Rect::from_min_size(
-                        cursor_min,
-                        egui::vec2(cell_width.max(1.0), cell_height.max(1.0)),
-                    );
-                    painter.rect_stroke(
-                        cursor_rect,
-                        0.0,
-                        egui::Stroke::new(1.0_f32, theme.terminal.cursor),
-                        egui::StrokeKind::Inside,
-                    );
-                }
-            }
+        if cursor_visible {
+            let cursor_min = top_left
+                + egui::vec2(
+                    cursor_col as f32 * cell_width,
+                    cursor_row as f32 * cell_height,
+                );
+            let cursor_rect = egui::Rect::from_min_size(
+                cursor_min,
+                egui::vec2(cell_width.max(1.0), cell_height.max(1.0)),
+            );
+            painter.rect_stroke(
+                cursor_rect,
+                0.0,
+                egui::Stroke::new(1.0_f32, theme.terminal.cursor),
+                egui::StrokeKind::Inside,
+            );
         }
 
         response

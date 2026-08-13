@@ -42,6 +42,18 @@ impl TerminalState {
         (row, col)
     }
 
+    /// Whether the terminal is currently scrolled back so the live screen is
+    /// not in view.
+    pub fn scrollback(&self) -> usize {
+        self.parser.screen().scrollback()
+    }
+
+    /// Whether the terminal emitted a "hide cursor" escape sequence
+    /// (DECTCEM), e.g. full-screen applications.
+    pub fn cursor_hidden(&self) -> bool {
+        self.parser.screen().hide_cursor()
+    }
+
     pub fn cell(&self, row: u16, col: u16) -> Option<&vt100::Cell> {
         self.parser.screen().cell(row, col)
     }

@@ -1,8 +1,10 @@
 use crate::terminal::TerminalGrid;
 use eframe::egui;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -26,38 +28,77 @@ impl Default for TypographyConfig {
     }
 }
 
+const PREFERRED_FONT_CANDIDATES: &[&str] = &[
+    "JetBrains Mono",
+    "Fira Code",
+    "Cascadia Code",
+    "Source Code Pro",
+    "DejaVu Sans Mono",
+    "Noto Sans Mono",
+    "Liberation Mono",
+    "Noto Mono",
+    "Ubuntu Mono",
+    "Ubuntu Sans Mono",
+    "Nimbus Mono PS",
+];
+
+/// Fonts fontconfig classifies as monospace but which are not usable as
+/// terminal fonts (e.g. emoji fonts where ASCII digit widths differ, or
+/// sign-language fonts without a Latin alphabet).
+const NON_TERMINAL_FONT_MARKERS: &[&str] = &["emoji", "signwriting"];
+
+const ASCII_MONOSPACE_PROBE: &str =
+    "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
 impl TypographyConfig {
+    /// Fonts that are actually installed on the system, genuinely monospace,
+    /// and safe to bind into egui. The list is discovered once per process.
     pub fn available_font_names() -> Vec<String> {
-        let mut names = TypographyConfig::system_font_candidates();
-        let mut seen = std::collections::BTreeSet::new();
-        names.retain(|name| seen.insert(name.clone()));
-        names
+        AVAILABLE_FONTS
+            .get_or_init(|| {
+                let mut names = Vec::new();
+                let mut seen = std::collections::BTreeSet::new();
+                for name in TypographyConfig::system_font_candidates()
+                    .into_iter()
+                    .chain(discovered_monospace_families())
+                {
+                    let trimmed = name.trim();
+                    if trimmed.is_empty() || !seen.insert(trimmed.to_owned()) {
+                        continue;
+                    }
+                    if is_usable_terminal_font(trimmed) {
+                        names.push(trimmed.to_owned());
+                    }
+                }
+                names
+            })
+            .clone()
     }
 
     pub fn system_font_candidates() -> Vec<String> {
-        let mut values = vec![
-            "JetBrains Mono".to_owned(),
-            "Fira Code".to_owned(),
-            "Cascadia Code".to_owned(),
-            "Source Code Pro".to_owned(),
-            "DejaVu Sans Mono".to_owned(),
-            "Noto Sans Mono".to_owned(),
-            "Liberation Mono".to_owned(),
-            "Monospace".to_owned(),
-        ];
+        let mut values = PREFERRED_FONT_CANDIDATES
+            .iter()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>();
+        values.push("Monospace".to_owned());
         let mut seen = std::collections::BTreeSet::new();
         values.retain(|value| seen.insert(value.clone()));
         values
     }
 
+    /// The font family that will actually be rendered in the terminal.
+    ///
+    /// Returns the user's selection only when it maps to an installed,
+    /// monospace font file. Otherwise it falls back to the first usable
+    /// system monospace font, never a non-existent or proportional font.
     pub fn resolved_terminal_font_name(&self) -> String {
         let trimmed = self.terminal_font.trim();
-        if !trimmed.is_empty() && font_file_for_family(trimmed).is_some() {
+        if !trimmed.is_empty() && usable_terminal_font_file(trimmed).is_some() {
             return trimmed.to_owned();
         }
 
         let fallback = default_system_monospace_font();
-        if font_file_for_family(&fallback).is_some() {
+        if usable_terminal_font_file(&fallback).is_some() {
             fallback
         } else {
             "monospace".to_owned()
@@ -68,47 +109,235 @@ impl TypographyConfig {
         egui::FontId::new(self.terminal_font_size, egui::FontFamily::Monospace)
     }
 
+    /// Width of one terminal cell in points.
+    ///
+    /// Uses the resolved font's real monospace advance width so columns always
+    /// match the rendered glyph width, no matter which font is installed.
     pub fn cell_width(&self) -> f32 {
-        self.terminal_font_size * 0.6 + self.character_spacing.max(0.0)
+        let size = self.terminal_font_size.max(1.0);
+        let base = terminal_font_metrics(&self.resolved_terminal_font_name())
+            .map(|m| m.advance_per_pt * size)
+            .unwrap_or(size * 0.6);
+        (base + self.character_spacing.max(0.0)).max(1.0)
     }
 
+    /// Height of one terminal cell in points.
+    ///
+    /// Uses the resolved font's natural line height so rows never overlap,
+    /// plus the configured extra line spacing.
     pub fn cell_height(&self) -> f32 {
-        self.terminal_font_size + self.line_spacing.max(0.0)
+        let size = self.terminal_font_size.max(1.0);
+        let base = terminal_font_metrics(&self.resolved_terminal_font_name())
+            .map(|m| m.height_per_pt * size)
+            .unwrap_or(size);
+        (base + self.line_spacing.max(0.0)).max(1.0)
     }
 
+    /// Loads the resolved terminal font into `egui::FontDefinitions` and binds
+    /// it as the first choice for `FontFamily::Monospace`, so the terminal
+    /// renderer (which paints with `FontId` of `FontFamily::Monospace`) uses
+    /// the selected font for every glyph.
     pub fn install_for_egui(&self, fonts: &mut egui::FontDefinitions) {
         let family = self.resolved_terminal_font_name();
         if family == "monospace" {
             return;
         }
 
-        if let Some(file) = font_file_for_family(&family) {
-            let bytes = match fs::read(file) {
-                Ok(bytes) => bytes,
-                Err(_) => return,
-            };
+        let Some(file) = usable_terminal_font_file(&family) else {
+            return;
+        };
+        let Ok(bytes) = fs::read(file) else {
+            return;
+        };
 
-            let key = format!("orbit-terminal-font-{}", family.replace(' ', "_"));
-            fonts.font_data.insert(
-                key.clone(),
-                std::sync::Arc::new(egui::FontData::from_owned(bytes)),
-            );
+        let key = format!("orbit-terminal-font-{}", family.replace(' ', "_"));
+        fonts.font_data.insert(
+            key.clone(),
+            std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+        );
 
-            let custom_family = egui::FontFamily::Name(family.clone().into());
-            let custom = fonts.families.entry(custom_family).or_default();
-            if !custom.iter().any(|name| name == &key) {
-                custom.insert(0, key.clone());
-            }
+        let custom_family = egui::FontFamily::Name(family.clone().into());
+        let custom = fonts.families.entry(custom_family).or_default();
+        if !custom.iter().any(|name| name == &key) {
+            custom.insert(0, key.clone());
+        }
 
-            let monospace = fonts
-                .families
-                .entry(egui::FontFamily::Monospace)
-                .or_default();
-            if !monospace.iter().any(|name| name == &key) {
-                monospace.insert(0, key);
+        let monospace = fonts
+            .families
+            .entry(egui::FontFamily::Monospace)
+            .or_default();
+        if !monospace.iter().any(|name| name == &key) {
+            monospace.insert(0, key);
+        }
+    }
+}
+
+static FONT_FILE_CACHE: OnceLock<Mutex<HashMap<String, Option<PathBuf>>>> = OnceLock::new();
+
+static USABLE_FONT_CACHE: OnceLock<Mutex<HashMap<String, Option<PathBuf>>>> = OnceLock::new();
+
+static FONT_METRICS_CACHE: OnceLock<Mutex<HashMap<String, Option<FontMetrics>>>> = OnceLock::new();
+
+static AVAILABLE_FONTS: OnceLock<Vec<String>> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug)]
+struct FontMetrics {
+    /// Monospace advance width in points for a terminal font size of 1.0.
+    advance_per_pt: f32,
+    /// Natural line box height in points for a terminal font size of 1.0.
+    height_per_pt: f32,
+}
+
+/// Resolves `family` to an installed font file that is genuinely monospace
+/// (all ASCII digits and letters share the same advance width) and not a
+/// known non-terminal font. The result is cached.
+fn usable_terminal_font_file(family: &str) -> Option<PathBuf> {
+    let trimmed = family.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if NON_TERMINAL_FONT_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return None;
+    }
+
+    let cache = USABLE_FONT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(hit) = cache
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(trimmed).cloned())
+    {
+        return hit;
+    }
+
+    let result = font_file_for_family(trimmed).filter(|file| font_is_monospace(file));
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(trimmed.to_owned(), result.clone());
+    }
+    result
+}
+
+/// True when `family` resolves to an installed font file that is genuinely
+/// monospace (all ASCII digits and letters share the same advance width).
+fn is_usable_terminal_font(family: &str) -> bool {
+    usable_terminal_font_file(family).is_some()
+}
+
+/// Cached advance/line-height metrics for a usable terminal font, measured in
+/// the same way egui lays out glyphs (so cell geometry matches rendering).
+fn terminal_font_metrics(family: &str) -> Option<FontMetrics> {
+    let trimmed = family.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let cache = FONT_METRICS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(hit) = cache
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(trimmed).copied())
+    {
+        return hit;
+    }
+
+    let result = measure_font_metrics(trimmed);
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(trimmed.to_owned(), result);
+    }
+    result
+}
+
+fn measure_font_metrics(family: &str) -> Option<FontMetrics> {
+    use ab_glyph::{Font as _, PxScale, ScaleFont as _};
+
+    let file = usable_terminal_font_file(family)?;
+    let bytes = fs::read(file).ok()?;
+    let font = ab_glyph::FontVec::try_from_vec(bytes).ok()?;
+    let units_per_em = font.units_per_em()?;
+    if !(16.0..=16_384.0).contains(&units_per_em) {
+        return None;
+    }
+
+    // egui scales a font so that `size * height_unscaled / units_per_em`
+    // becomes the pixel-per-em. Measure at a font size of 1.0 point and let
+    // callers scale linearly with the actual size.
+    let pixels_per_em = PxScale::from(1.0 * font.height_unscaled() / units_per_em);
+    let scaled = font.as_scaled(pixels_per_em);
+    let advance = scaled.h_advance(font.glyph_id('M'));
+    let height = scaled.ascent() - scaled.descent() + scaled.line_gap();
+    if advance <= 0.0 || height <= 0.0 {
+        return None;
+    }
+
+    Some(FontMetrics {
+        advance_per_pt: advance,
+        height_per_pt: height,
+    })
+}
+
+fn discovered_monospace_families() -> Vec<String> {
+    let mut families = Vec::new();
+    let Ok(output) = std::process::Command::new("fc-list")
+        .args([":spacing=100", "--format=%{family[0]}\n"])
+        .output()
+    else {
+        return families;
+    };
+    if !output.status.success() {
+        return families;
+    }
+
+    let mut seen = std::collections::BTreeSet::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let name = line.trim();
+        if name.is_empty() || !seen.insert(name.to_owned()) {
+            continue;
+        }
+        families.push(name.to_owned());
+    }
+    families
+}
+
+fn font_is_monospace(path: &Path) -> bool {
+    use ab_glyph::{Font as _, ScaleFont as _};
+
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    let Ok(font) = ab_glyph::FontVec::try_from_vec(bytes) else {
+        return false;
+    };
+    // egui panics when a font's units-per-em is outside this range; reject
+    // such fonts up front so a runtime font switch can never crash.
+    let units_per_em = font.units_per_em().unwrap_or(0.0);
+    if !(16.0..=16_384.0).contains(&units_per_em) {
+        return false;
+    }
+    let Some(scale) = font.pt_to_px_scale(12.0) else {
+        return false;
+    };
+    let scaled = font.as_scaled(scale);
+
+    let mut reference: Option<f32> = None;
+    for c in ASCII_MONOSPACE_PROBE.chars() {
+        let advance = scaled.h_advance(font.glyph_id(c));
+        if advance <= 0.0 {
+            return false;
+        }
+        match reference {
+            None => reference = Some(advance),
+            Some(expected) => {
+                if (advance - expected).abs() > 0.05 {
+                    return false;
+                }
             }
         }
     }
+    reference.is_some()
 }
 
 fn font_file_for_family(family: &str) -> Option<PathBuf> {
@@ -117,18 +346,37 @@ fn font_file_for_family(family: &str) -> Option<PathBuf> {
         return None;
     }
 
-    let expected = family_name_variants(trimmed);
+    let cache = FONT_FILE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(hit) = cache
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(trimmed).cloned())
+    {
+        return hit;
+    }
+
+    let result = font_file_for_family_uncached(trimmed);
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(trimmed.to_owned(), result.clone());
+    }
+    result
+}
+
+fn font_file_for_family_uncached(family: &str) -> Option<PathBuf> {
+    let expected = family_name_variants(family);
     for candidate in expected {
         if let Ok(output) = std::process::Command::new("fc-match")
-            .args(["--format=%{file}\n", &candidate])
+            .args(["--format=%{family[0]}|%{file}\n", &candidate])
             .output()
         {
             if output.status.success() {
                 let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-                if !value.is_empty() {
-                    let path = PathBuf::from(value);
-                    if path.exists() {
-                        return Some(path);
+                if let Some((matched_family, matched_file)) = value.split_once('|') {
+                    if matched_family.eq_ignore_ascii_case(family) {
+                        let path = PathBuf::from(matched_file.trim());
+                        if path.exists() {
+                            return Some(path);
+                        }
                     }
                 }
             }
@@ -214,7 +462,7 @@ fn config_path() -> PathBuf {
 
 fn default_system_monospace_font() -> String {
     for candidate in TypographyConfig::system_font_candidates() {
-        if font_file_for_family(&candidate).is_some() {
+        if is_usable_terminal_font(&candidate) {
             return candidate;
         }
     }
@@ -264,7 +512,10 @@ fn find_font_in_standard_directories(family: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{TerminalConfig, TypographyConfig, default_system_monospace_font};
+    use super::{
+        TerminalConfig, TypographyConfig, default_system_monospace_font, font_file_for_family,
+        font_is_monospace,
+    };
     use eframe::egui;
 
     #[test]
@@ -286,7 +537,58 @@ mod tests {
     }
 
     #[test]
-    fn custom_terminal_font_is_bound_in_egui_font_definitions() {
+    fn every_offered_font_is_installed_and_monospace() {
+        let names = TypographyConfig::available_font_names();
+        assert!(
+            !names.is_empty(),
+            "at least one system monospace font exists"
+        );
+        for name in names {
+            let file = font_file_for_family(&name)
+                .unwrap_or_else(|| panic!("font {name:?} has no font file"));
+            assert!(
+                font_is_monospace(&file),
+                "offered font {name:?} at {file:?} is not genuinely monospace"
+            );
+        }
+    }
+
+    #[test]
+    fn fonts_that_are_not_installed_are_not_offered() {
+        let names = TypographyConfig::available_font_names();
+        for fake in [
+            "JetBrains Mono",
+            "Fira Code",
+            "Cascadia Code",
+            "Source Code Pro",
+        ] {
+            if font_file_for_family(fake).is_none() {
+                assert!(
+                    !names.iter().any(|name| name == fake),
+                    "uninstalled font {fake:?} must not be offered"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn proportional_system_font_is_never_used_as_terminal_font() {
+        // A known proportional font (if installed) must never become the
+        // resolved terminal font, even if explicitly requested.
+        let mut config = TypographyConfig::default();
+        config.terminal_font = "Noto Sans".to_owned();
+        let resolved = config.resolved_terminal_font_name();
+        if font_file_for_family("Noto Sans").is_some() {
+            assert!(
+                !resolved.eq_ignore_ascii_case("Noto Sans"),
+                "proportional font must not be used as the terminal font"
+            );
+        }
+        assert_ne!(resolved, "monospace");
+    }
+
+    #[test]
+    fn selected_installed_font_is_resolved_and_bound() {
         let family = default_system_monospace_font();
         if family == "monospace" {
             return;
@@ -300,6 +602,8 @@ mod tests {
             ui_font_size: 14.0,
         };
 
+        assert_eq!(config.resolved_terminal_font_name(), family);
+
         let mut fonts = egui::FontDefinitions::default();
         config.install_for_egui(&mut fonts);
 
@@ -308,6 +612,82 @@ mod tests {
                 .families
                 .contains_key(&egui::FontFamily::Name(family.clone().into())),
             "custom font family {family:?} should be bound for egui"
+        );
+        let monospace = fonts.families.get(&egui::FontFamily::Monospace).unwrap();
+        assert!(
+            monospace
+                .first()
+                .is_some_and(|name| name.starts_with("orbit-terminal-font-")),
+            "the selected font must be first in the Monospace family"
+        );
+    }
+
+    #[test]
+    fn runtime_font_switch_changes_rendered_glyph_metrics() {
+        // Mirrors the app's runtime path (`apply_typography`): install the
+        // selected font into FontDefinitions, hand them to a live Context via
+        // `set_fonts`, run a pass, then measure what Monospace actually
+        // renders. Switching fonts must change the measured metrics, proving
+        // the selected font reaches the renderer.
+        use eframe::egui::Context;
+        let names = TypographyConfig::available_font_names();
+        if names.len() < 2 {
+            return;
+        }
+
+        let ctx = Context::default();
+        let mut metrics = Vec::new();
+        for family in names.iter().take(2) {
+            let config = TypographyConfig {
+                terminal_font: family.clone(),
+                ..Default::default()
+            };
+            let mut fonts_def = egui::FontDefinitions::default();
+            config.install_for_egui(&mut fonts_def);
+            ctx.set_fonts(fonts_def);
+            ctx.begin_pass(egui::RawInput::default());
+            let id = egui::FontId::monospace(config.terminal_font_size);
+            metrics.push(ctx.fonts(|f| f.glyph_width(&id, 'M')));
+        }
+        assert_ne!(
+            metrics[0], metrics[1],
+            "switching terminal font must change rendered glyph width"
+        );
+    }
+
+    #[test]
+    fn distinct_fonts_have_distinct_glyph_metrics() {
+        // The whole point of font switching: two different installed fonts
+        // must not render identical glyphs.
+        use eframe::egui::epaint::image::AlphaFromCoverage;
+        let names = TypographyConfig::available_font_names();
+        if names.len() < 2 {
+            return;
+        }
+        let mut widths = Vec::new();
+        for family in &names {
+            let config = TypographyConfig {
+                terminal_font: family.clone(),
+                terminal_font_size: 13.0,
+                line_spacing: 0.0,
+                character_spacing: 0.0,
+                ui_font_size: 14.0,
+            };
+            let mut fonts_def = egui::FontDefinitions::default();
+            config.install_for_egui(&mut fonts_def);
+            let fonts =
+                egui::epaint::text::Fonts::new(1.0, 4096, AlphaFromCoverage::default(), fonts_def);
+            let id = egui::FontId::monospace(13.0);
+            let mut metrics = Vec::new();
+            for c in ['M', 'W', '0', 'i', 'm', 'A'] {
+                metrics.push((c, fonts.glyph_width(&id, c)));
+            }
+            widths.push((family.clone(), metrics));
+        }
+        let first = &widths[0].1;
+        assert!(
+            widths.iter().skip(1).any(|(_, m)| m != first),
+            "installed fonts must differ in glyph metrics"
         );
     }
 }

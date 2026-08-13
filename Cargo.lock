@@ -1637,6 +1637,7 @@ dependencies = [
 name = "orbit"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "anyhow",
  "crossbeam-channel",
  "eframe",
