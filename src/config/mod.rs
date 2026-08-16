@@ -28,6 +28,85 @@ impl Default for TypographyConfig {
     }
 }
 
+/// Tint presets for the glass material layer.
+///
+/// The tint only affects the background/material layer; it never recolors
+/// terminal text, which is always painted with the theme's own colors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GlassTint {
+    Neutral,
+    Purple,
+    Pink,
+    Cyan,
+    Blue,
+    Green,
+    Custom,
+}
+
+impl GlassTint {
+    pub const ALL: [GlassTint; 7] = [
+        GlassTint::Neutral,
+        GlassTint::Purple,
+        GlassTint::Pink,
+        GlassTint::Cyan,
+        GlassTint::Blue,
+        GlassTint::Green,
+        GlassTint::Custom,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            GlassTint::Neutral => "Neutral",
+            GlassTint::Purple => "Purple",
+            GlassTint::Pink => "Pink",
+            GlassTint::Cyan => "Cyan",
+            GlassTint::Blue => "Blue",
+            GlassTint::Green => "Green",
+            GlassTint::Custom => "Custom",
+        }
+    }
+}
+
+/// Glassmorphism / acrylic material configuration.
+///
+/// Kept logically separate from the theme: changing the theme never resets
+/// glass settings and changing glass settings never resets the theme.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct GlassConfig {
+    /// Master switch. When disabled ORBIT renders as a normal opaque terminal.
+    pub enabled: bool,
+    /// Overall opacity of the glass layer (1.0 = fully opaque).
+    pub opacity: f32,
+    /// Tint applied to the glass layer only.
+    pub tint: GlassTint,
+    /// How strongly the tint color is mixed into the theme background.
+    pub tint_opacity: f32,
+    /// Blur strength. Only meaningful on backends that expose native blur
+    /// (e.g. KWin via the X11 blur region). On other compositors it is stored
+    /// for future use and has no visual effect.
+    pub blur_strength: f32,
+    /// Opacity of the subtle material border.
+    pub border_opacity: f32,
+    /// RGB values used when `tint == GlassTint::Custom`.
+    pub custom_tint: [u8; 3],
+}
+
+impl Default for GlassConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            opacity: 0.82,
+            tint: GlassTint::Neutral,
+            tint_opacity: 0.30,
+            blur_strength: 4.0,
+            border_opacity: 0.50,
+            custom_tint: [110, 70, 180],
+        }
+    }
+}
+
 const PREFERRED_FONT_CANDIDATES: &[&str] = &[
     "JetBrains Mono",
     "Fira Code",
@@ -397,6 +476,7 @@ pub struct TerminalConfig {
     pub scrollback_lines: usize,
     pub theme: String,
     pub typography: TypographyConfig,
+    pub glass: GlassConfig,
 }
 
 impl Default for TerminalConfig {
@@ -408,6 +488,7 @@ impl Default for TerminalConfig {
             scrollback_lines: 10_000,
             theme: "orbit-dark".to_owned(),
             typography: TypographyConfig::default(),
+            glass: GlassConfig::default(),
         }
     }
 }

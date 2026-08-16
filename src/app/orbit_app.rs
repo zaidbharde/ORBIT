@@ -1,7 +1,10 @@
-use crate::config::{TerminalConfig, TypographyConfig};
+use crate::config::{GlassConfig, GlassTint, TerminalConfig, TypographyConfig};
+use crate::glass::GlassBackend;
+use crate::glass::backend::{apply_x11_blur_region, x11_window_id};
 use crate::pty::{PtyCommand, PtySession};
 use crate::terminal::{TerminalGrid, TerminalState};
 use eframe::egui;
+use raw_window_handle::HasWindowHandle;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -14,7 +17,14 @@ pub fn run() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("ORBIT")
             .with_app_id("dev.orbit.terminal")
-            .with_inner_size([960.0, 640.0]),
+            .with_inner_size([960.0, 640.0])
+            // The window is always created with an ARGB-capable surface so the
+            // glass material can show the desktop through it at runtime. When
+            // glass is disabled every pixel is painted opaque, so the window
+            // looks like a normal opaque terminal. Platforms without an alpha
+            // visual (X11 without compositor) fall back to an opaque surface
+            // automatically and ORBIT keeps working.
+            .with_transparent(true),
         ..Default::default()
     };
 
@@ -39,6 +49,11 @@ struct OrbitApp {
     theme_name: String,
     theme: crate::theme::Theme,
     available_themes: Vec<&'static str>,
+    // Glass / acrylic material
+    glass: GlassConfig,
+    glass_settings_open: bool,
+    backend: &'static GlassBackend,
+    last_blur_size: Option<egui::Vec2>,
 }
 
 struct TerminalTab {
@@ -131,6 +146,7 @@ impl OrbitApp {
             }
         }
         let theme = crate::theme::get_theme(&theme_name);
+        let glass = config.glass.clone();
 
         let mut app = Self {
             config,
@@ -150,7 +166,12 @@ impl OrbitApp {
             theme_name,
             theme,
             available_themes,
+            glass,
+            glass_settings_open: false,
+            backend: crate::glass::backend::probe(),
+            last_blur_size: None,
         };
+        eprintln!("[ORBIT] glass backend: {}", app.backend.describe());
         app.apply_typography(&creation.egui_ctx);
         app.apply_theme(&creation.egui_ctx);
         app.typography_dirty = false;
@@ -298,7 +319,173 @@ impl OrbitApp {
                 self.typography_dirty = true;
                 self.persist_config();
             }
+
+            ui.separator();
+
+            let glass_label = if self.glass.enabled {
+                "Glass: ON"
+            } else {
+                "Glass: OFF"
+            };
+            if ui
+                .button(glass_label)
+                .on_hover_text("Toggle the glass background (no restart needed)")
+                .clicked()
+            {
+                self.glass.enabled = !self.glass.enabled;
+                self.glass_changed();
+            }
+            if self.glass.enabled {
+                let settings_button = ui
+                    .button("Settings")
+                    .on_hover_text("Glass material settings");
+                if settings_button.clicked() {
+                    self.glass_settings_open = !self.glass_settings_open;
+                }
+                if self.glass_settings_open {
+                    egui::Popup::from_response(&settings_button)
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                        .show(|ui| {
+                            self.glass_settings_ui(ui);
+                        });
+                }
+            }
         });
+    }
+
+    fn glass_settings_ui(&mut self, ui: &mut egui::Ui) {
+        let mut changed = false;
+        ui.set_min_width(300.0);
+        ui.label(egui::RichText::new("Glass material").strong());
+        ui.separator();
+
+        changed |= ui
+            .add(egui::Slider::new(&mut self.glass.opacity, 0.3..=1.0).text("Opacity"))
+            .changed();
+        changed |= ui
+            .add(egui::Slider::new(&mut self.glass.tint_opacity, 0.0..=1.0).text("Tint strength"))
+            .changed();
+        changed |= ui
+            .add(egui::Slider::new(&mut self.glass.blur_strength, 0.0..=10.0).text("Blur strength"))
+            .changed();
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut self.glass.border_opacity, 0.0..=1.0).text("Border opacity"),
+            )
+            .changed();
+
+        ui.horizontal(|ui| {
+            ui.label("Tint");
+            egui::ComboBox::from_id_salt("glass_tint_combo")
+                .selected_text(self.glass.tint.label())
+                .show_ui(ui, |ui| {
+                    for tint in GlassTint::ALL {
+                        if ui
+                            .selectable_label(self.glass.tint == tint, tint.label())
+                            .clicked()
+                        {
+                            self.glass.tint = tint;
+                            changed = true;
+                        }
+                    }
+                });
+        });
+
+        if self.glass.tint == GlassTint::Custom {
+            let mut rgb = self.glass.custom_tint;
+            changed |= ui
+                .add(egui::Slider::new(&mut rgb[0], 0..=255).text("R"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut rgb[1], 0..=255).text("G"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut rgb[2], 0..=255).text("B"))
+                .changed();
+            self.glass.custom_tint = rgb;
+        }
+
+        if changed {
+            self.glass_changed();
+        }
+
+        ui.separator();
+        ui.label(
+            egui::RichText::new(self.backend.describe())
+                .small()
+                .color(self.theme.ui.secondary_text),
+        );
+        ui.label(
+            egui::RichText::new(
+                "Blur strength only applies on compositors that expose window blur.",
+            )
+            .small()
+            .color(self.theme.ui.secondary_text),
+        );
+    }
+
+    fn glass_changed(&mut self) {
+        self.config.glass = self.glass.clone();
+        self.persist_config();
+    }
+
+    /// Background color for the central area, glass-aware.
+    fn glass_background(&self) -> egui::Color32 {
+        if self.glass.enabled {
+            crate::glass::glass_fill(
+                self.theme.ui.background,
+                self.glass.tint,
+                self.glass.custom_tint,
+                self.glass.tint_opacity,
+                self.glass.opacity,
+            )
+        } else {
+            self.theme.ui.background
+        }
+    }
+
+    /// Panel (chrome) color for bars and side panels, glass-aware.
+    fn glass_panel(&self) -> egui::Color32 {
+        if self.glass.enabled {
+            crate::glass::glass_fill(
+                self.theme.ui.panel,
+                self.glass.tint,
+                self.glass.custom_tint,
+                self.glass.tint_opacity,
+                self.glass.opacity,
+            )
+        } else {
+            self.theme.ui.panel
+        }
+    }
+
+    /// Keeps the compositor blur region in sync with the window size. Only
+    /// does real work when a native blur backend is active, and only when the
+    /// window actually changed size.
+    fn update_glass_backdrop(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        if !self.glass.enabled || self.glass.blur_strength <= 0.0 {
+            return;
+        }
+        if !self.backend.x11_blur_available() {
+            return;
+        }
+        let size = ctx.screen_rect().size();
+        if self.last_blur_size == Some(size) {
+            return;
+        }
+        self.last_blur_size = Some(size);
+        let Ok(handle) = frame.window_handle() else {
+            return;
+        };
+        let Some(window) = x11_window_id(&handle) else {
+            return;
+        };
+        let scale = ctx.pixels_per_point();
+        let width = (size.x * scale).round().max(1.0) as u32;
+        let height = (size.y * scale).round().max(1.0) as u32;
+        if let Err(error) = apply_x11_blur_region(window, 0, 0, width, height) {
+            eprintln!("[ORBIT] failed to apply blur region: {error}");
+        }
     }
 
     fn ui_search_bar(&mut self, ui: &mut egui::Ui) {
@@ -360,7 +547,7 @@ impl OrbitApp {
         egui::SidePanel::right("orbit_history")
             .resizable(true)
             .default_width(280.0)
-            .frame(egui::Frame::new().fill(self.theme.ui.panel))
+            .frame(egui::Frame::new().fill(self.glass_panel()))
             .show(ctx, |ui| {
                 ui.heading("Command History");
                 ui.separator();
@@ -454,12 +641,13 @@ impl OrbitApp {
         // Clone theme before mutably borrowing tabs to avoid borrow conflicts
         let theme = self.theme.clone();
         let typography = self.config.typography.clone();
+        let glass = self.glass.clone();
         let Some(tab) = self.active_tab_mut() else {
             let (_, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click());
             return response;
         };
 
-        tab.paint(ui, &theme, &typography)
+        tab.paint(ui, &theme, &typography, &glass)
     }
 
     fn active_status_label(&self) -> (String, egui::Color32) {
@@ -735,10 +923,11 @@ impl TerminalTab {
         ui: &mut egui::Ui,
         theme: &crate::theme::Theme,
         typography: &TypographyConfig,
+        glass: &GlassConfig,
     ) -> egui::Response {
         match &mut self.panes {
             PaneLayout::Single(pane) => {
-                pane.paint(ui, self.active_pane == pane.id, theme, typography)
+                pane.paint(ui, self.active_pane == pane.id, theme, typography, glass)
             }
             PaneLayout::Split {
                 axis,
@@ -750,13 +939,19 @@ impl TerminalTab {
                     let half_height = (available.y - 6.0).max(0.0) / 2.0;
                     let first_response = ui
                         .allocate_ui(egui::vec2(available.x, half_height), |ui| {
-                            first.paint(ui, self.active_pane == first.id, theme, typography)
+                            first.paint(ui, self.active_pane == first.id, theme, typography, glass)
                         })
                         .inner;
                     ui.add_space(6.0);
                     let second_response = ui
                         .allocate_ui(ui.available_size(), |ui| {
-                            second.paint(ui, self.active_pane == second.id, theme, typography)
+                            second.paint(
+                                ui,
+                                self.active_pane == second.id,
+                                theme,
+                                typography,
+                                glass,
+                            )
                         })
                         .inner;
 
@@ -780,13 +975,25 @@ impl TerminalTab {
                     ui.horizontal(|ui| {
                         let first_response = ui
                             .allocate_ui(egui::vec2(half_width, available.y), |ui| {
-                                first.paint(ui, self.active_pane == first.id, theme, typography)
+                                first.paint(
+                                    ui,
+                                    self.active_pane == first.id,
+                                    theme,
+                                    typography,
+                                    glass,
+                                )
                             })
                             .inner;
                         ui.add_space(6.0);
                         let second_response = ui
                             .allocate_ui(ui.available_size(), |ui| {
-                                second.paint(ui, self.active_pane == second.id, theme, typography)
+                                second.paint(
+                                    ui,
+                                    self.active_pane == second.id,
+                                    theme,
+                                    typography,
+                                    glass,
+                                )
                             })
                             .inner;
 
@@ -974,6 +1181,7 @@ impl TerminalPane {
         is_active: bool,
         theme: &crate::theme::Theme,
         typography: &TypographyConfig,
+        glass: &GlassConfig,
     ) -> egui::Response {
         let available = ui.available_size();
         let cell_width = typography.cell_width().max(1.0);
@@ -1013,13 +1221,42 @@ impl TerminalPane {
         } else {
             theme.ui.border
         };
-        painter.rect_filled(rect, 0.0, theme.terminal.background);
+        // Glass material layer: translucent, theme-tinted. It is painted
+        // *below* every glyph; the cells/cursor/selection are painted on top
+        // with opaque theme colors so text stays sharp.
+        let fill = if glass.enabled {
+            crate::glass::glass_fill(
+                theme.terminal.background,
+                glass.tint,
+                glass.custom_tint,
+                glass.tint_opacity,
+                glass.opacity,
+            )
+        } else {
+            theme.terminal.background
+        };
+        painter.rect_filled(rect, 0.0, fill);
+        let border_color = if glass.enabled {
+            crate::glass::with_alpha(border, glass.border_opacity)
+        } else {
+            border
+        };
         painter.rect_stroke(
             rect,
             0.0_f32,
-            egui::Stroke::new(1.0_f32, border),
+            egui::Stroke::new(1.0_f32, border_color),
             egui::StrokeKind::Inside,
         );
+        if glass.enabled {
+            // Subtle top edge highlight on the material.
+            painter.line_segment(
+                [
+                    rect.left_top() + egui::vec2(1.0, 1.0),
+                    rect.right_top() + egui::vec2(-1.0, 1.0),
+                ],
+                egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(20)),
+            );
+        }
 
         let font_id = typography.terminal_font_id();
         let top_left = rect.left_top() + egui::vec2(10.0, 8.0);
@@ -1383,11 +1620,25 @@ impl Selection {
 }
 
 impl eframe::App for OrbitApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    /// Background the window is cleared with before panels are painted.
+    ///
+    /// With glass enabled the clear color is fully transparent so the desktop
+    /// shows through the translucent material. With glass disabled it is the
+    /// opaque theme background, so the window looks like a normal terminal
+    /// even on surfaces that keep an alpha channel.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        if self.glass.enabled {
+            [0.0, 0.0, 0.0, 0.0]
+        } else {
+            self.theme.ui.background.to_normalized_gamma_f32()
+        }
+    }
+
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.drain_pty();
 
         egui::TopBottomPanel::top("orbit_tabs")
-            .frame(egui::Frame::new().fill(self.theme.ui.panel))
+            .frame(egui::Frame::new().fill(self.glass_panel()))
             .show(ctx, |ui| {
                 self.ui_top_bar(ui);
                 self.ui_search_bar(ui);
@@ -1405,11 +1656,13 @@ impl eframe::App for OrbitApp {
         self.ui_history_panel(ctx);
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(self.theme.ui.background))
+            .frame(egui::Frame::new().fill(self.glass_background()))
             .show(ctx, |ui| {
                 let response = self.paint_active_tab(ui);
                 self.handle_keyboard(ctx, response.has_focus());
             });
+
+        self.update_glass_backdrop(ctx, frame);
 
         ctx.request_repaint_after(Duration::from_millis(16));
     }

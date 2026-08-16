@@ -1642,9 +1642,11 @@ dependencies = [
  "crossbeam-channel",
  "eframe",
  "portable-pty",
+ "raw-window-handle",
  "serde",
  "toml",
  "vt100",
+ "x11rb",
 ]
 
 [[package]]
