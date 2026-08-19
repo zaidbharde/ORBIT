@@ -9,6 +9,9 @@ pub struct TerminalTheme {
     pub selection_fg: Option<Color32>,
     pub ansi: [Color32; 16],
     pub search_highlight: Color32,
+    /// Background of the *current* search match, so it is distinguishable
+    /// from all other matches.
+    pub search_current: Color32,
 }
 
 #[derive(Clone)]
@@ -97,6 +100,7 @@ fn orbit_dark() -> Theme {
             selection_fg: None,
             ansi,
             search_highlight: Color32::from_rgb(95, 82, 32),
+            search_current: Color32::from_rgb(160, 130, 50),
         },
         ui: UiTheme {
             background: Color32::from_rgb(8, 10, 12),
@@ -147,6 +151,7 @@ fn orbit_light() -> Theme {
             selection_fg: None,
             ansi,
             search_highlight: Color32::from_rgb(200, 180, 140),
+            search_current: Color32::from_rgb(150, 110, 50),
         },
         ui: UiTheme {
             background: Color32::from_rgb(250, 250, 250),
@@ -197,6 +202,7 @@ fn cyberpunk() -> Theme {
             selection_fg: None,
             ansi,
             search_highlight: Color32::from_rgb(255, 200, 64),
+            search_current: Color32::from_rgb(255, 90, 170),
         },
         ui: UiTheme {
             background: Color32::from_rgb(8, 6, 10),
@@ -247,6 +253,7 @@ fn midnight_purple() -> Theme {
             selection_fg: None,
             ansi,
             search_highlight: Color32::from_rgb(200, 160, 220),
+            search_current: Color32::from_rgb(240, 190, 255),
         },
         ui: UiTheme {
             background: Color32::from_rgb(14, 8, 26),
@@ -297,6 +304,7 @@ fn frost() -> Theme {
             selection_fg: None,
             ansi,
             search_highlight: Color32::from_rgb(140, 160, 190),
+            search_current: Color32::from_rgb(190, 230, 255),
         },
         ui: UiTheme {
             background: Color32::from_rgb(10, 18, 22),

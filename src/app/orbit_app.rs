@@ -1,4 +1,7 @@
-use crate::config::{GlassConfig, GlassTint, TerminalConfig, TypographyConfig};
+use crate::config::{
+    AppearanceConfig, CursorColorMode, CursorStyle, GlassConfig, GlassTint, TerminalConfig,
+    TypographyConfig,
+};
 use crate::glass::GlassBackend;
 use crate::glass::backend::{apply_x11_blur_region, x11_window_id};
 use crate::pty::{PtyCommand, PtySession};
@@ -45,6 +48,7 @@ struct OrbitApp {
     history_open: bool,
     typography_dirty: bool,
     theme_dirty: bool,
+    appearance_dirty: bool,
     // Theme
     theme_name: String,
     theme: crate::theme::Theme,
@@ -52,8 +56,12 @@ struct OrbitApp {
     // Glass / acrylic material
     glass: GlassConfig,
     glass_settings_open: bool,
+    appearance_settings_open: bool,
     backend: &'static GlassBackend,
     last_blur_size: Option<egui::Vec2>,
+    debug_pane_id: Option<egui::Id>,
+    debug_focus_requested: bool,
+    debug_search_focused: bool,
 }
 
 struct TerminalTab {
@@ -86,6 +94,7 @@ struct TerminalPane {
     scrollback_rows: usize,
     selection: Option<Selection>,
     search_query: String,
+    search_current: Option<(usize, usize)>,
     current_command: String,
     history: Vec<CommandHistoryEntry>,
     history_filter: String,
@@ -163,13 +172,18 @@ impl OrbitApp {
             history_open: false,
             typography_dirty: true,
             theme_dirty: true,
+            appearance_dirty: false,
             theme_name,
             theme,
             available_themes,
             glass,
             glass_settings_open: false,
+            appearance_settings_open: false,
             backend: crate::glass::backend::probe(),
             last_blur_size: None,
+            debug_pane_id: None,
+            debug_focus_requested: false,
+            debug_search_focused: false,
         };
         eprintln!("[ORBIT] glass backend: {}", app.backend.describe());
         app.apply_typography(&creation.egui_ctx);
@@ -194,25 +208,11 @@ impl OrbitApp {
     }
 
     fn ui_top_bar(&mut self, ui: &mut egui::Ui) {
+        let mut close_tab: Option<usize> = None;
         ui.horizontal(|ui| {
             for index in 0..self.tabs.len() {
-                let selected = index == self.active_tab;
-                let title = self.tabs[index].title.clone();
-                let fill = if selected {
-                    self.theme.ui.tab_active
-                } else {
-                    self.theme.ui.tab_inactive
-                };
-                let text_color = if selected {
-                    self.theme.ui.text
-                } else {
-                    self.theme.ui.secondary_text
-                };
-                let tab_button = egui::Button::new(egui::RichText::new(title).color(text_color))
-                    .fill(fill)
-                    .stroke(egui::Stroke::new(1.0_f32, self.theme.ui.divider));
-                if ui.add(tab_button).clicked() {
-                    self.active_tab = index;
+                if self.ui_tab(ui, index) {
+                    close_tab = Some(index);
                 }
             }
 
@@ -220,9 +220,6 @@ impl OrbitApp {
 
             if ui.button("+").on_hover_text("New tab").clicked() {
                 self.new_tab();
-            }
-            if ui.button("x").on_hover_text("Close tab").clicked() {
-                self.close_active_tab();
             }
             if ui.button("H").on_hover_text("Command history").clicked() {
                 self.history_open = !self.history_open;
@@ -322,6 +319,20 @@ impl OrbitApp {
 
             ui.separator();
 
+            let appearance_button = ui
+                .button("Appearance")
+                .on_hover_text("Cursor and appearance settings");
+            if appearance_button.clicked() {
+                self.appearance_settings_open = !self.appearance_settings_open;
+            }
+            if self.appearance_settings_open {
+                egui::Popup::from_response(&appearance_button)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .show(|ui| {
+                        self.appearance_settings_ui(ui);
+                    });
+            }
+
             let glass_label = if self.glass.enabled {
                 "Glass: ON"
             } else {
@@ -351,6 +362,107 @@ impl OrbitApp {
                 }
             }
         });
+
+        if let Some(index) = close_tab {
+            self.close_tab(index);
+        }
+    }
+
+    /// One tab chip: rounded background, hover highlight, accent underline on
+    /// the active tab and a per-tab close button. Returns `true` when this
+    /// tab's close button was clicked.
+    fn ui_tab(&mut self, ui: &mut egui::Ui, index: usize) -> bool {
+        let selected = index == self.active_tab;
+        let title = self.tabs[index].title.clone();
+        let theme = self.theme.clone();
+        let appearance = self.config.appearance.clone();
+        let radius = appearance.panel_radius.clamp(0.0, 12.0) as u8;
+
+        let font_id = egui::TextStyle::Body.resolve(ui.style());
+        let text_size = ui
+            .fonts(|fonts| fonts.layout_no_wrap(title.clone(), font_id.clone(), theme.ui.text))
+            .size();
+        let close_size = 14.0;
+        let height = 26.0;
+        let width = text_size.x + if selected { close_size + 16.0 } else { 14.0 };
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(width.max(24.0), height), egui::Sense::click());
+
+        if response.clicked() {
+            self.active_tab = index;
+        }
+
+        let hovered = response.hovered();
+        let fill = if selected {
+            theme.ui.tab_active
+        } else if hovered {
+            lerp_color(theme.ui.tab_inactive, theme.ui.tab_active, 0.45)
+        } else {
+            theme.ui.tab_inactive
+        };
+        ui.painter().rect_filled(rect, radius, fill);
+        ui.painter().rect_stroke(
+            rect,
+            radius,
+            egui::Stroke::new(1.0_f32, theme.ui.divider),
+            egui::StrokeKind::Inside,
+        );
+        if selected {
+            ui.painter().rect_filled(
+                egui::Rect::from_min_max(
+                    rect.left_bottom() - egui::vec2(0.0, 2.0),
+                    rect.right_bottom(),
+                ),
+                1.0,
+                theme.ui.accent,
+            );
+        }
+
+        let text_color = if selected {
+            theme.ui.text
+        } else {
+            theme.ui.secondary_text
+        };
+        ui.painter().text(
+            rect.left_top() + egui::vec2(6.0, (height - text_size.y) / 2.0),
+            egui::Align2::LEFT_TOP,
+            title,
+            font_id,
+            text_color,
+        );
+
+        let mut closed = false;
+        if selected || hovered {
+            let close_rect = egui::Rect::from_center_size(
+                rect.right_center() - egui::vec2(close_size / 2.0 + 4.0, 0.0),
+                egui::vec2(close_size, close_size),
+            );
+            let close_response = ui.interact(
+                close_rect,
+                ui.id().with("orbit_tab_close").with(index),
+                egui::Sense::click(),
+            );
+            if close_response.hovered() {
+                ui.painter()
+                    .circle_filled(close_rect.center(), close_size / 2.0, theme.ui.divider);
+            }
+            ui.painter().text(
+                close_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "×",
+                egui::FontId::proportional(12.0),
+                if close_response.hovered() {
+                    theme.ui.text
+                } else {
+                    theme.ui.secondary_text
+                },
+            );
+            if close_response.clicked() {
+                closed = true;
+            }
+        }
+
+        closed
     }
 
     fn glass_settings_ui(&mut self, ui: &mut egui::Ui) {
@@ -367,11 +479,6 @@ impl OrbitApp {
             .changed();
         changed |= ui
             .add(egui::Slider::new(&mut self.glass.blur_strength, 0.0..=10.0).text("Blur strength"))
-            .changed();
-        changed |= ui
-            .add(
-                egui::Slider::new(&mut self.glass.border_opacity, 0.0..=1.0).text("Border opacity"),
-            )
             .changed();
 
         ui.horizontal(|ui| {
@@ -427,6 +534,131 @@ impl OrbitApp {
     fn glass_changed(&mut self) {
         self.config.glass = self.glass.clone();
         self.persist_config();
+    }
+
+    fn appearance_settings_ui(&mut self, ui: &mut egui::Ui) {
+        let mut changed = false;
+        ui.set_min_width(340.0);
+        ui.label(egui::RichText::new("Appearance").strong());
+        ui.label(
+            egui::RichText::new("Applies immediately; no restart needed.")
+                .small()
+                .color(self.theme.ui.secondary_text),
+        );
+        ui.separator();
+
+        ui.horizontal(|ui| {
+            ui.label("Cursor style");
+            egui::ComboBox::from_id_salt("appearance_cursor_style")
+                .selected_text(self.config.appearance.cursor_style.label())
+                .show_ui(ui, |ui| {
+                    for style in CursorStyle::ALL {
+                        if ui
+                            .selectable_label(
+                                self.config.appearance.cursor_style == style,
+                                style.label(),
+                            )
+                            .clicked()
+                        {
+                            self.config.appearance.cursor_style = style;
+                            changed = true;
+                        }
+                    }
+                });
+        });
+        ui.horizontal(|ui| {
+            ui.label("Cursor blink");
+            changed |= ui
+                .checkbox(&mut self.config.appearance.cursor_blink, "Blink")
+                .changed();
+            if self.config.appearance.cursor_blink {
+                egui::ComboBox::from_id_salt("appearance_blink_speed")
+                    .selected_text(self.config.appearance.cursor_blink_speed.label())
+                    .show_ui(ui, |ui| {
+                        for speed in crate::config::CursorBlinkSpeed::ALL {
+                            if ui
+                                .selectable_label(
+                                    self.config.appearance.cursor_blink_speed == speed,
+                                    speed.label(),
+                                )
+                                .clicked()
+                            {
+                                self.config.appearance.cursor_blink_speed = speed;
+                                changed = true;
+                            }
+                        }
+                    });
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Cursor color");
+            egui::ComboBox::from_id_salt("appearance_cursor_color_mode")
+                .selected_text(self.config.appearance.cursor_color_mode.label())
+                .show_ui(ui, |ui| {
+                    for mode in CursorColorMode::ALL {
+                        if ui
+                            .selectable_label(
+                                self.config.appearance.cursor_color_mode == mode,
+                                mode.label(),
+                            )
+                            .clicked()
+                        {
+                            self.config.appearance.cursor_color_mode = mode;
+                            changed = true;
+                        }
+                    }
+                });
+        });
+        if self.config.appearance.cursor_color_mode == CursorColorMode::Custom {
+            let mut rgb = self.config.appearance.cursor_custom_color;
+            changed |= ui
+                .add(egui::Slider::new(&mut rgb[0], 0..=255).text("R"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut rgb[1], 0..=255).text("G"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut rgb[2], 0..=255).text("B"))
+                .changed();
+            self.config.appearance.cursor_custom_color = rgb;
+        }
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut self.config.appearance.cursor_thickness, 1.0..=8.0)
+                    .text("Cursor thickness"),
+            )
+            .changed();
+
+        ui.separator();
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut self.config.appearance.panel_radius, 0.0..=16.0)
+                    .text("Panel radius"),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut self.config.appearance.border_width, 0.0..=4.0)
+                    .text("Border width"),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut self.config.appearance.border_opacity, 0.0..=1.0)
+                    .text("Border opacity"),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut self.config.appearance.spacing_scale, 0.8..=1.4)
+                    .text("Spacing scale"),
+            )
+            .changed();
+
+        if changed {
+            self.appearance_dirty = true;
+            self.persist_config();
+        }
     }
 
     /// Background color for the central area, glass-aware.
@@ -495,6 +727,9 @@ impl OrbitApp {
 
         let active_pane_id = self.active_tab().map(|tab| tab.active_pane);
         let mut close_search = false;
+        let mut focus_requested = false;
+        let debug_env = std::env::var_os("ORBIT_DEBUG_EVENTS").is_some();
+        let should_autofocus = debug_env && !self.debug_search_focused;
         ui.horizontal(|ui| {
             ui.label("Search");
             if let Some(pane) = self.active_pane_mut() {
@@ -507,6 +742,11 @@ impl OrbitApp {
                 );
                 if response.changed() {
                     pane.search_query = local_query.clone();
+                    pane.search_current = None;
+                }
+                if should_autofocus {
+                    ui.memory_mut(|m| m.request_focus(response.id));
+                    focus_requested = true;
                 }
                 if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
                     close_search = true;
@@ -527,6 +767,7 @@ impl OrbitApp {
             if ui.button("Clear").clicked() {
                 if let Some(pane) = self.active_pane_mut() {
                     pane.search_query.clear();
+                    pane.search_current = None;
                 }
             }
             if let Some(id) = active_pane_id {
@@ -537,6 +778,9 @@ impl OrbitApp {
         if close_search {
             self.search_open = false;
         }
+        if focus_requested {
+            self.debug_search_focused = true;
+        }
     }
 
     fn ui_history_panel(&mut self, ctx: &egui::Context) {
@@ -544,10 +788,21 @@ impl OrbitApp {
             return;
         }
 
+        let border_color =
+            crate::glass::with_alpha(self.theme.ui.border, self.config.appearance.border_opacity);
+        let frame = egui::Frame::new()
+            .fill(self.glass_panel())
+            .corner_radius(self.config.appearance.panel_radius.clamp(0.0, 16.0) as u8)
+            .inner_margin(egui::Margin::same(10))
+            .stroke(egui::Stroke::new(
+                self.config.appearance.border_width.clamp(0.0, 4.0),
+                border_color,
+            ));
+
         egui::SidePanel::right("orbit_history")
             .resizable(true)
             .default_width(280.0)
-            .frame(egui::Frame::new().fill(self.glass_panel()))
+            .frame(frame)
             .show(ctx, |ui| {
                 ui.heading("Command History");
                 ui.separator();
@@ -642,12 +897,17 @@ impl OrbitApp {
         let theme = self.theme.clone();
         let typography = self.config.typography.clone();
         let glass = self.glass.clone();
+        let appearance = self.config.appearance.clone();
         let Some(tab) = self.active_tab_mut() else {
             let (_, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click());
             return response;
         };
 
-        tab.paint(ui, &theme, &typography, &glass)
+        let response = tab.paint(ui, &theme, &typography, &glass, &appearance);
+        if std::env::var_os("ORBIT_DEBUG_EVENTS").is_some() {
+            self.debug_pane_id = Some(response.id);
+        }
+        response
     }
 
     fn active_status_label(&self) -> (String, egui::Color32) {
@@ -704,6 +964,12 @@ impl OrbitApp {
 
             style.visuals.window_stroke.color = theme.ui.border;
             style.visuals.window_stroke.width = 1.0;
+
+            let scale = self.config.appearance.spacing_scale.clamp(0.8, 1.4);
+            style.spacing.item_spacing = egui::vec2(8.0, 6.0) * scale;
+            style.spacing.button_padding = egui::vec2(6.0, 3.0) * scale;
+            style.spacing.interact_size.y = 24.0 * scale;
+            style.spacing.window_margin = egui::Margin::same((8.0 * scale).round() as i8);
         });
     }
 
@@ -756,7 +1022,10 @@ impl OrbitApp {
             AppAction::SplitVertical => self.split_active_pane(SplitAxis::Vertical),
             AppAction::ClosePane => self.close_active_pane(),
             AppAction::RestartPane => self.restart_active_pane(),
-            AppAction::ToggleSearch => self.search_open = !self.search_open,
+            AppAction::ToggleSearch => {
+                self.search_open = !self.search_open;
+                self.debug_search_focused = false;
+            }
             AppAction::ToggleHistory => self.history_open = !self.history_open,
             AppAction::CopySelection => {
                 if let Some(pane) = self.active_pane_mut() {
@@ -825,6 +1094,21 @@ impl OrbitApp {
         }
 
         self.tabs.remove(self.active_tab);
+        self.active_tab = self.active_tab.min(self.tabs.len().saturating_sub(1));
+    }
+
+    /// Closes the tab at `index` (used by the per-tab close button). Closing
+    /// the last tab restarts its pane instead, like `close_active_tab`.
+    fn close_tab(&mut self, index: usize) {
+        if self.tabs.len() <= 1 {
+            self.restart_active_pane();
+            return;
+        }
+
+        self.tabs.remove(index);
+        if index < self.active_tab {
+            self.active_tab -= 1;
+        }
         self.active_tab = self.active_tab.min(self.tabs.len().saturating_sub(1));
     }
 
@@ -924,11 +1208,17 @@ impl TerminalTab {
         theme: &crate::theme::Theme,
         typography: &TypographyConfig,
         glass: &GlassConfig,
+        appearance: &AppearanceConfig,
     ) -> egui::Response {
         match &mut self.panes {
-            PaneLayout::Single(pane) => {
-                pane.paint(ui, self.active_pane == pane.id, theme, typography, glass)
-            }
+            PaneLayout::Single(pane) => pane.paint(
+                ui,
+                self.active_pane == pane.id,
+                theme,
+                typography,
+                glass,
+                appearance,
+            ),
             PaneLayout::Split {
                 axis,
                 first,
@@ -936,13 +1226,21 @@ impl TerminalTab {
             } => match axis {
                 SplitAxis::Horizontal => {
                     let available = ui.available_size();
-                    let half_height = (available.y - 6.0).max(0.0) / 2.0;
+                    let gap = 6.0 * appearance.spacing_scale.clamp(0.8, 1.4);
+                    let half_height = (available.y - gap).max(0.0) / 2.0;
                     let first_response = ui
                         .allocate_ui(egui::vec2(available.x, half_height), |ui| {
-                            first.paint(ui, self.active_pane == first.id, theme, typography, glass)
+                            first.paint(
+                                ui,
+                                self.active_pane == first.id,
+                                theme,
+                                typography,
+                                glass,
+                                appearance,
+                            )
                         })
                         .inner;
-                    ui.add_space(6.0);
+                    ui.add_space(gap);
                     let second_response = ui
                         .allocate_ui(ui.available_size(), |ui| {
                             second.paint(
@@ -951,6 +1249,7 @@ impl TerminalTab {
                                 theme,
                                 typography,
                                 glass,
+                                appearance,
                             )
                         })
                         .inner;
@@ -970,7 +1269,8 @@ impl TerminalTab {
                 }
                 SplitAxis::Vertical => {
                     let available = ui.available_size();
-                    let half_width = (available.x - 6.0).max(0.0) / 2.0;
+                    let gap = 6.0 * appearance.spacing_scale.clamp(0.8, 1.4);
+                    let half_width = (available.x - gap).max(0.0) / 2.0;
                     let mut response = None;
                     ui.horizontal(|ui| {
                         let first_response = ui
@@ -981,10 +1281,11 @@ impl TerminalTab {
                                     theme,
                                     typography,
                                     glass,
+                                    appearance,
                                 )
                             })
                             .inner;
-                        ui.add_space(6.0);
+                        ui.add_space(gap);
                         let second_response = ui
                             .allocate_ui(ui.available_size(), |ui| {
                                 second.paint(
@@ -993,6 +1294,7 @@ impl TerminalTab {
                                     theme,
                                     typography,
                                     glass,
+                                    appearance,
                                 )
                             })
                             .inner;
@@ -1113,6 +1415,7 @@ impl TerminalPane {
             scrollback_rows: 0,
             selection: None,
             search_query: String::new(),
+            search_current: None,
             current_command: String::new(),
             history: Vec::new(),
             history_filter: String::new(),
@@ -1130,6 +1433,7 @@ impl TerminalPane {
             scrollback_rows: 0,
             selection: None,
             search_query: String::new(),
+            search_current: None,
             current_command: String::new(),
             history: Vec::new(),
             history_filter: String::new(),
@@ -1148,6 +1452,7 @@ impl TerminalPane {
         .map_err(|err| err.to_string());
         self.scrollback_rows = 0;
         self.selection = None;
+        self.search_current = None;
         self.current_command.clear();
         self.exited = false;
     }
@@ -1182,6 +1487,7 @@ impl TerminalPane {
         theme: &crate::theme::Theme,
         typography: &TypographyConfig,
         glass: &GlassConfig,
+        appearance: &AppearanceConfig,
     ) -> egui::Response {
         let available = ui.available_size();
         let cell_width = typography.cell_width().max(1.0);
@@ -1235,18 +1541,18 @@ impl TerminalPane {
         } else {
             theme.terminal.background
         };
-        painter.rect_filled(rect, 0.0, fill);
-        let border_color = if glass.enabled {
-            crate::glass::with_alpha(border, glass.border_opacity)
-        } else {
-            border
-        };
-        painter.rect_stroke(
-            rect,
-            0.0_f32,
-            egui::Stroke::new(1.0_f32, border_color),
-            egui::StrokeKind::Inside,
-        );
+        let radius = appearance.panel_radius.clamp(0.0, 16.0);
+        let border_width = appearance.border_width.clamp(0.0, 4.0);
+        let border_color = crate::glass::with_alpha(border, appearance.border_opacity);
+        painter.rect_filled(rect, radius, fill);
+        if border_width > 0.0 {
+            painter.rect_stroke(
+                rect,
+                radius,
+                egui::Stroke::new(border_width, border_color),
+                egui::StrokeKind::Inside,
+            );
+        }
         if glass.enabled {
             // Subtle top edge highlight on the material.
             painter.line_segment(
@@ -1273,6 +1579,14 @@ impl TerminalPane {
             && !self.terminal.cursor_hidden()
             && self.terminal.scrollback() == 0;
         let (cursor_row, cursor_col) = self.terminal.cursor_position();
+        let cursor_color = resolved_cursor_color(appearance, theme);
+        let cursor_glyph_color = contrast_glyph_color(cursor_color, theme);
+        let blink_hidden = cursor_visible
+            && appearance.cursor_blink
+            && !appearance
+                .cursor_blink_speed
+                .on_at(ui.input(|input| input.time));
+        let search_current = self.search_current;
 
         for (row_index, line) in rows.iter().enumerate() {
             let search_matches = if search_query.is_empty() {
@@ -1312,6 +1626,11 @@ impl TerminalPane {
                     && search_matches
                         .iter()
                         .any(|start| col >= *start && col < *start + search_len);
+                let current_match = !selected
+                    && search_len > 0
+                    && search_current.is_some_and(|(row, start)| {
+                        row_index == row && col >= start && col < start + search_len
+                    });
 
                 let fg = if selected {
                     theme
@@ -1323,6 +1642,8 @@ impl TerminalPane {
                 };
                 let bg = if selected {
                     theme.terminal.selection_bg
+                } else if current_match {
+                    theme.terminal.search_current
                 } else if searched {
                     theme.terminal.search_highlight
                 } else {
@@ -1345,22 +1666,61 @@ impl TerminalPane {
             }
         }
 
-        if cursor_visible {
+        if cursor_visible && !blink_hidden {
             let cursor_min = top_left
                 + egui::vec2(
                     cursor_col as f32 * cell_width,
                     cursor_row as f32 * cell_height,
                 );
-            let cursor_rect = egui::Rect::from_min_size(
-                cursor_min,
-                egui::vec2(cell_width.max(1.0), cell_height.max(1.0)),
-            );
-            painter.rect_stroke(
-                cursor_rect,
-                0.0,
-                egui::Stroke::new(1.0_f32, theme.terminal.cursor),
-                egui::StrokeKind::Inside,
-            );
+
+            match appearance.cursor_style {
+                CursorStyle::Block => {
+                    let cell = self.terminal.cell(cursor_row, cursor_col);
+                    let span = if cell.is_some_and(|cell| cell.is_wide()) {
+                        2.0
+                    } else {
+                        1.0
+                    };
+                    let cursor_rect = egui::Rect::from_min_size(
+                        cursor_min,
+                        egui::vec2(cell_width * span, cell_height),
+                    );
+                    painter.rect_filled(cursor_rect, 2.0, cursor_color);
+                    // Paint the covered glyph in a contrasting color so text
+                    // stays readable under a filled block cursor.
+                    if let Some(cell) = cell {
+                        if cell.has_contents() {
+                            painter.text(
+                                cursor_rect.left_top(),
+                                egui::Align2::LEFT_TOP,
+                                cell.contents(),
+                                font_id.clone(),
+                                cursor_glyph_color,
+                            );
+                        }
+                    }
+                }
+                CursorStyle::Beam => {
+                    let thickness = appearance
+                        .cursor_thickness
+                        .clamp(1.0, (cell_width * 0.6).max(1.0));
+                    let beam_rect = egui::Rect::from_min_size(
+                        cursor_min + egui::vec2(1.0, 0.0),
+                        egui::vec2(thickness, cell_height),
+                    );
+                    painter.rect_filled(beam_rect, 1.0, cursor_color);
+                }
+                CursorStyle::Underline => {
+                    let thickness = appearance
+                        .cursor_thickness
+                        .clamp(1.0, (cell_height * 0.4).max(1.0));
+                    let underline_rect = egui::Rect::from_min_size(
+                        cursor_min + egui::vec2(0.0, cell_height - thickness - 1.0),
+                        egui::vec2(cell_width, thickness),
+                    );
+                    painter.rect_filled(underline_rect, 1.0, cursor_color);
+                }
+            }
         }
 
         response
@@ -1544,6 +1904,12 @@ impl TerminalPane {
 
     fn find_next_match(&mut self) {
         let matches = self.find_all_matches();
+        if std::env::var_os("ORBIT_DEBUG_EVENTS").is_some() {
+            eprintln!(
+                "[DBG] find_next: query={:?} matches={:?} current={:?}",
+                self.search_query, matches, self.search_current
+            );
+        }
         if matches.is_empty() {
             return;
         }
@@ -1564,6 +1930,7 @@ impl TerminalPane {
                 anchor: (mr, mc),
                 focus: (mr, mc + self.search_query.chars().count()),
             });
+            self.search_current = Some((mr, mc));
             return;
         }
 
@@ -1573,6 +1940,7 @@ impl TerminalPane {
             anchor: (mr, mc),
             focus: (mr, mc + self.search_query.chars().count()),
         });
+        self.search_current = Some((mr, mc));
     }
 
     fn find_previous_match(&mut self) {
@@ -1597,6 +1965,7 @@ impl TerminalPane {
                 anchor: (mr, mc),
                 focus: (mr, mc + self.search_query.chars().count()),
             });
+            self.search_current = Some((mr, mc));
             return;
         }
 
@@ -1606,6 +1975,7 @@ impl TerminalPane {
             anchor: (mr, mc),
             focus: (mr, mc + self.search_query.chars().count()),
         });
+        self.search_current = Some((mr, mc));
     }
 }
 
@@ -1635,18 +2005,41 @@ impl eframe::App for OrbitApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if std::env::var_os("ORBIT_DEBUG_EVENTS").is_some() {
+            let events = ctx.input(|input| input.events.clone());
+            if !events.is_empty() {
+                eprintln!("[DBG] {} events: {:?}", events.len(), events);
+            }
+            if !self.debug_focus_requested {
+                if let Some(id) = self.debug_pane_id {
+                    ctx.memory_mut(|memory| memory.request_focus(id));
+                    self.debug_focus_requested = true;
+                    eprintln!("[DBG] focusing terminal pane {:?}", id);
+                }
+            }
+        }
         self.drain_pty();
 
         egui::TopBottomPanel::top("orbit_tabs")
-            .frame(egui::Frame::new().fill(self.glass_panel()))
+            .frame(
+                egui::Frame::new()
+                    .fill(self.glass_panel())
+                    .inner_margin(egui::Margin {
+                        left: 6,
+                        right: 6,
+                        top: 4,
+                        bottom: 4,
+                    }),
+            )
             .show(ctx, |ui| {
                 self.ui_top_bar(ui);
                 self.ui_search_bar(ui);
             });
 
-        if self.theme_dirty {
+        if self.theme_dirty || self.appearance_dirty {
             self.apply_theme(ctx);
             self.theme_dirty = false;
+            self.appearance_dirty = false;
         }
         if self.typography_dirty {
             self.apply_typography(ctx);
@@ -1827,6 +2220,68 @@ fn color_from_vt100(
         vt100::Color::Default => default_color,
         vt100::Color::Idx(index) => theme.terminal.ansi[index as usize],
         vt100::Color::Rgb(red, green, blue) => egui::Color32::from_rgb(red, green, blue),
+    }
+}
+
+/// Perceived brightness of a color on a 0..255 scale.
+fn luminance(color: egui::Color32) -> f32 {
+    color.r() as f32 * 0.299 + color.g() as f32 * 0.587 + color.b() as f32 * 0.114
+}
+
+/// Linear RGB interpolation between two colors.
+fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0);
+    egui::Color32::from_rgb(
+        (a.r() as f32 + (b.r() as f32 - a.r() as f32) * t).round() as u8,
+        (a.g() as f32 + (b.g() as f32 - a.g() as f32) * t).round() as u8,
+        (a.b() as f32 + (b.b() as f32 - a.b() as f32) * t).round() as u8,
+    )
+}
+
+/// The effective cursor color: theme cursor or custom color, always adjusted
+/// so it stays clearly visible against the terminal background.
+fn resolved_cursor_color(
+    appearance: &AppearanceConfig,
+    theme: &crate::theme::Theme,
+) -> egui::Color32 {
+    let color = match appearance.cursor_color_mode {
+        CursorColorMode::Theme => theme.terminal.cursor,
+        CursorColorMode::Custom => egui::Color32::from_rgb(
+            appearance.cursor_custom_color[0],
+            appearance.cursor_custom_color[1],
+            appearance.cursor_custom_color[2],
+        ),
+    };
+    ensure_cursor_contrast(color, theme)
+}
+
+/// Nudges a cursor color toward the theme foreground/background until it
+/// differs enough from the terminal background to stay visible.
+fn ensure_cursor_contrast(cursor: egui::Color32, theme: &crate::theme::Theme) -> egui::Color32 {
+    const MIN_LUMINANCE_DIFF: f32 = 60.0;
+    let background = theme.terminal.background;
+    if (luminance(cursor) - luminance(background)).abs() >= MIN_LUMINANCE_DIFF {
+        return cursor;
+    }
+    let to_fg = (luminance(cursor) - luminance(theme.terminal.foreground)).abs();
+    let to_bg = (luminance(cursor) - luminance(background)).abs();
+    let target = if to_fg > to_bg {
+        theme.terminal.foreground
+    } else {
+        background
+    };
+    lerp_color(cursor, target, 0.7)
+}
+
+/// Glyph color to paint *on top of* a filled block cursor so the covered text
+/// stays readable no matter which cursor color is configured.
+fn contrast_glyph_color(cursor: egui::Color32, theme: &crate::theme::Theme) -> egui::Color32 {
+    let to_fg = (luminance(cursor) - luminance(theme.terminal.foreground)).abs();
+    let to_bg = (luminance(cursor) - luminance(theme.terminal.background)).abs();
+    if to_fg > to_bg {
+        theme.terminal.foreground
+    } else {
+        theme.terminal.background
     }
 }
 

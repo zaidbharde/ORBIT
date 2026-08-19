@@ -87,8 +87,6 @@ pub struct GlassConfig {
     /// (e.g. KWin via the X11 blur region). On other compositors it is stored
     /// for future use and has no visual effect.
     pub blur_strength: f32,
-    /// Opacity of the subtle material border.
-    pub border_opacity: f32,
     /// RGB values used when `tint == GlassTint::Custom`.
     pub custom_tint: [u8; 3],
 }
@@ -101,8 +99,156 @@ impl Default for GlassConfig {
             tint: GlassTint::Neutral,
             tint_opacity: 0.30,
             blur_strength: 4.0,
-            border_opacity: 0.50,
             custom_tint: [110, 70, 180],
+        }
+    }
+}
+
+/// Cursor shape for the terminal insertion point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CursorStyle {
+    Block,
+    Beam,
+    Underline,
+}
+
+impl Default for CursorStyle {
+    fn default() -> Self {
+        Self::Block
+    }
+}
+
+impl CursorStyle {
+    pub const ALL: [CursorStyle; 3] = [
+        CursorStyle::Block,
+        CursorStyle::Beam,
+        CursorStyle::Underline,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CursorStyle::Block => "Block",
+            CursorStyle::Beam => "Beam",
+            CursorStyle::Underline => "Underline",
+        }
+    }
+}
+
+/// How fast the cursor blinks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CursorBlinkSpeed {
+    Slow,
+    Normal,
+    Fast,
+}
+
+impl Default for CursorBlinkSpeed {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
+impl CursorBlinkSpeed {
+    pub const ALL: [CursorBlinkSpeed; 3] = [
+        CursorBlinkSpeed::Slow,
+        CursorBlinkSpeed::Normal,
+        CursorBlinkSpeed::Fast,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CursorBlinkSpeed::Slow => "Slow",
+            CursorBlinkSpeed::Normal => "Normal",
+            CursorBlinkSpeed::Fast => "Fast",
+        }
+    }
+
+    /// Full blink period in seconds (visible phase + hidden phase).
+    pub fn period(self) -> f32 {
+        match self {
+            CursorBlinkSpeed::Slow => 1.2,
+            CursorBlinkSpeed::Normal => 0.7,
+            CursorBlinkSpeed::Fast => 0.4,
+        }
+    }
+
+    /// Whether the cursor is in its visible phase at `time` (seconds, e.g.
+    /// `egui::Context::input().time`). Pure function of time: no timers or
+    /// animation loops are involved.
+    pub fn on_at(self, time: f64) -> bool {
+        (time / self.period() as f64).fract() < 0.5
+    }
+}
+
+/// Where the cursor color comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CursorColorMode {
+    Theme,
+    Custom,
+}
+
+impl Default for CursorColorMode {
+    fn default() -> Self {
+        Self::Theme
+    }
+}
+
+impl CursorColorMode {
+    pub const ALL: [CursorColorMode; 2] = [CursorColorMode::Theme, CursorColorMode::Custom];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CursorColorMode::Theme => "Theme",
+            CursorColorMode::Custom => "Custom",
+        }
+    }
+}
+
+/// Cursor & general appearance settings.
+///
+/// Kept logically separate from typography, theme and glass: changing any of
+/// those never resets appearance settings and vice versa.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct AppearanceConfig {
+    /// Shape of the terminal cursor.
+    pub cursor_style: CursorStyle,
+    /// Whether the cursor blinks when the terminal is focused.
+    pub cursor_blink: bool,
+    /// Blink speed (period) when `cursor_blink` is on.
+    pub cursor_blink_speed: CursorBlinkSpeed,
+    /// Where the cursor color comes from.
+    pub cursor_color_mode: CursorColorMode,
+    /// RGB used when `cursor_color_mode == CursorColorMode::Custom`.
+    pub cursor_custom_color: [u8; 3],
+    /// Thickness in points for Beam/Underline cursors.
+    pub cursor_thickness: f32,
+    /// Corner radius in points for panels and the terminal surface.
+    pub panel_radius: f32,
+    /// Border width in points for the terminal surface and panels.
+    pub border_width: f32,
+    /// Border opacity (0.0 = invisible, 1.0 = opaque).
+    pub border_opacity: f32,
+    /// Multiplier for UI spacing (toolbar, tabs, panels).
+    pub spacing_scale: f32,
+}
+
+impl Default for AppearanceConfig {
+    fn default() -> Self {
+        Self {
+            cursor_style: CursorStyle::Block,
+            cursor_blink: true,
+            cursor_blink_speed: CursorBlinkSpeed::Normal,
+            cursor_color_mode: CursorColorMode::Theme,
+            cursor_custom_color: [120, 190, 255],
+            cursor_thickness: 2.0,
+            panel_radius: 10.0,
+            border_width: 1.0,
+            border_opacity: 0.55,
+            spacing_scale: 1.0,
         }
     }
 }
@@ -477,6 +623,7 @@ pub struct TerminalConfig {
     pub theme: String,
     pub typography: TypographyConfig,
     pub glass: GlassConfig,
+    pub appearance: AppearanceConfig,
 }
 
 impl Default for TerminalConfig {
@@ -489,6 +636,7 @@ impl Default for TerminalConfig {
             theme: "orbit-dark".to_owned(),
             typography: TypographyConfig::default(),
             glass: GlassConfig::default(),
+            appearance: AppearanceConfig::default(),
         }
     }
 }
@@ -508,7 +656,12 @@ impl TerminalConfig {
                 }
                 config
             }
-            Err(_) => Self::default(),
+            Err(err) => {
+                if std::env::var_os("ORBIT_DEBUG_EVENTS").is_some() {
+                    eprintln!("[DBG] config parse error: {err}");
+                }
+                Self::default()
+            }
         }
     }
 
@@ -594,10 +747,60 @@ fn find_font_in_standard_directories(family: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        TerminalConfig, TypographyConfig, default_system_monospace_font, font_file_for_family,
-        font_is_monospace,
+        AppearanceConfig, CursorBlinkSpeed, CursorColorMode, CursorStyle, TerminalConfig,
+        TypographyConfig, default_system_monospace_font, font_file_for_family, font_is_monospace,
     };
     use eframe::egui;
+
+    #[test]
+    fn appearance_defaults_are_sane() {
+        let appearance = AppearanceConfig::default();
+        assert_eq!(appearance.cursor_style, CursorStyle::Block);
+        assert!(appearance.cursor_blink);
+        assert_eq!(appearance.cursor_blink_speed, CursorBlinkSpeed::Normal);
+        assert_eq!(appearance.cursor_color_mode, CursorColorMode::Theme);
+        assert!(appearance.cursor_thickness > 0.0);
+        assert!((0.0..=16.0).contains(&appearance.panel_radius));
+        assert!((0.0..=4.0).contains(&appearance.border_width));
+        assert!((0.0..=1.0).contains(&appearance.border_opacity));
+        assert!((0.8..=1.4).contains(&appearance.spacing_scale));
+    }
+
+    #[test]
+    fn appearance_round_trips_through_toml() {
+        let config = TerminalConfig::default();
+        let payload = toml::to_string(&config).unwrap();
+        let loaded: TerminalConfig = toml::from_str(&payload).unwrap();
+        assert_eq!(config.appearance, loaded.appearance);
+    }
+
+    #[test]
+    fn missing_appearance_section_falls_back_to_defaults() {
+        let payload = "shell = \"/bin/bash\"\ntheme = \"frost\"\n";
+        let loaded: TerminalConfig = toml::from_str(payload).unwrap();
+        assert_eq!(loaded.appearance, AppearanceConfig::default());
+        assert_eq!(loaded.theme, "frost");
+    }
+
+    #[test]
+    fn blink_speed_periods_are_positive_and_ordered() {
+        let slow = CursorBlinkSpeed::Slow.period();
+        let normal = CursorBlinkSpeed::Normal.period();
+        let fast = CursorBlinkSpeed::Fast.period();
+        assert!(slow > normal && normal > fast && fast > 0.0);
+    }
+
+    #[test]
+    fn blink_phase_is_a_pure_function_of_time() {
+        // The visible phase must repeat with the configured period.
+        let speed = CursorBlinkSpeed::Normal;
+        let period = speed.period() as f64;
+        assert!(speed.on_at(0.1));
+        assert!(speed.on_at(0.1 + period));
+        assert_eq!(speed.on_at(0.1), speed.on_at(0.1 + 2.0 * period));
+        // A point in the second half of the period is hidden.
+        assert!(!speed.on_at(0.6 * period));
+    }
 
     #[test]
     fn typography_defaults_are_sane() {
