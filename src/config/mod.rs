@@ -1,4 +1,5 @@
 use crate::terminal::TerminalGrid;
+use crate::workspace::Workspace;
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -624,6 +625,13 @@ pub struct TerminalConfig {
     pub typography: TypographyConfig,
     pub glass: GlassConfig,
     pub appearance: AppearanceConfig,
+    /// Saved workspaces (metadata plus serialized layouts). Order is the
+    /// user-visible workspace order.
+    pub workspaces: Vec<Workspace>,
+    /// Id of the workspace that was active on the last run.
+    pub active_workspace: String,
+    /// Id of the workspace marked as default.
+    pub default_workspace: String,
 }
 
 impl Default for TerminalConfig {
@@ -637,6 +645,9 @@ impl Default for TerminalConfig {
             typography: TypographyConfig::default(),
             glass: GlassConfig::default(),
             appearance: AppearanceConfig::default(),
+            workspaces: Vec::new(),
+            active_workspace: String::new(),
+            default_workspace: String::new(),
         }
     }
 }

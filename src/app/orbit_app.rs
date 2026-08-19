@@ -6,11 +6,16 @@ use crate::glass::GlassBackend;
 use crate::glass::backend::{apply_x11_blur_region, x11_window_id};
 use crate::pty::{PtyCommand, PtySession};
 use crate::terminal::{TerminalGrid, TerminalState};
+use crate::workspace::{
+    SavedPane, SavedPaneLayout, SavedTab, SplitAxis, Workspace, WorkspaceManager, WorkspacePreset,
+    WorkspaceRuntime, new_id, resolve_dir_input, resolve_working_dir,
+};
 use eframe::egui;
 use raw_window_handle::HasWindowHandle;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 const MAX_SCROLLBACK_OFFSET: usize = 10_000;
@@ -40,15 +45,18 @@ pub fn run() -> eframe::Result {
 
 struct OrbitApp {
     config: TerminalConfig,
-    tabs: Vec<TerminalTab>,
-    active_tab: usize,
-    next_tab_id: usize,
-    next_pane_id: usize,
+    manager: WorkspaceManager<TerminalTab>,
+    workspace_dialog: Option<WorkspaceDialog>,
     search_open: bool,
     history_open: bool,
     typography_dirty: bool,
     theme_dirty: bool,
     appearance_dirty: bool,
+    // Command palette
+    command_palette_open: bool,
+    palette_filter: String,
+    palette_selected: usize,
+    palette_just_opened: bool,
     // Theme
     theme_name: String,
     theme: crate::theme::Theme,
@@ -62,6 +70,18 @@ struct OrbitApp {
     debug_pane_id: Option<egui::Id>,
     debug_focus_requested: bool,
     debug_search_focused: bool,
+}
+
+enum WorkspaceDialog {
+    Create {
+        name: String,
+        preset: WorkspacePreset,
+        dir: String,
+    },
+    Rename {
+        id: String,
+        name: String,
+    },
 }
 
 struct TerminalTab {
@@ -80,14 +100,10 @@ enum PaneLayout {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SplitAxis {
-    Horizontal,
-    Vertical,
-}
-
 struct TerminalPane {
     id: usize,
+    title: String,
+    working_dir: PathBuf,
     terminal: TerminalState,
     pty: Result<PtySession, String>,
     last_grid: TerminalGrid,
@@ -132,14 +148,45 @@ enum AppAction {
     PreviousPane,
     PageUp,
     PageDown,
+    NextWorkspace,
+    PreviousWorkspace,
+    ToggleCommandPalette,
+}
+
+#[derive(Clone, Debug)]
+enum PaletteAction {
+    App(AppAction),
+    SwitchToWorkspace(usize),
+    NewWorkspace,
+    RenameWorkspace,
+    DuplicateWorkspace,
+    DeleteWorkspace,
+    SetDefaultWorkspace(usize),
+    SaveWorkspace,
 }
 
 impl OrbitApp {
     fn new(creation: &eframe::CreationContext<'_>) -> Self {
-        let config = TerminalConfig::load();
-        let mut next_pane_id = 1;
-        let first_pane = TerminalPane::new(next_pane_id, &config, config.initial_grid);
-        next_pane_id += 1;
+        let mut config = TerminalConfig::load();
+        if config.workspaces.is_empty() {
+            config.workspaces = crate::workspace::default_workspaces(&config.working_dir);
+            let _ = config.save();
+        }
+        for ws in &mut config.workspaces {
+            if ws.preset == WorkspacePreset::Unknown {
+                ws.preset = WorkspacePreset::Blank;
+            }
+        }
+        let runtimes = config
+            .workspaces
+            .iter()
+            .map(|ws| Self::build_runtime(&config, ws))
+            .collect();
+        let manager = WorkspaceManager::new(
+            runtimes,
+            &config.active_workspace,
+            &config.default_workspace,
+        );
 
         let available_themes = crate::theme::get_theme_names();
         // Theme preference: config.theme takes precedence, but allow ~/.orbit_theme override.
@@ -159,20 +206,17 @@ impl OrbitApp {
 
         let mut app = Self {
             config,
-            tabs: vec![TerminalTab {
-                id: 1,
-                title: "shell 1".to_owned(),
-                panes: PaneLayout::Single(first_pane),
-                active_pane: 1,
-            }],
-            active_tab: 0,
-            next_tab_id: 2,
-            next_pane_id,
+            manager,
+            workspace_dialog: None,
             search_open: false,
             history_open: false,
             typography_dirty: true,
             theme_dirty: true,
             appearance_dirty: false,
+            command_palette_open: false,
+            palette_filter: String::new(),
+            palette_selected: 0,
+            palette_just_opened: false,
             theme_name,
             theme,
             available_themes,
@@ -190,27 +234,56 @@ impl OrbitApp {
         app.apply_theme(&creation.egui_ctx);
         app.typography_dirty = false;
         app.theme_dirty = false;
+        app.persist_config();
         app
     }
 
+    /// Builds a live workspace runtime from a saved workspace: spawns fresh
+    /// PTY sessions for every saved pane, resolving directories safely.
+    fn build_runtime(config: &TerminalConfig, ws: &Workspace) -> WorkspaceRuntime<TerminalTab> {
+        let mut next_tab_id = 1usize;
+        let mut next_pane_id = 1usize;
+        let tabs = if ws.tabs.is_empty() {
+            vec![TerminalTab::build_default(ws, config)]
+        } else {
+            ws.tabs
+                .iter()
+                .map(|saved| TerminalTab::from_saved(saved, ws, config))
+                .collect()
+        };
+        for tab in &tabs {
+            next_tab_id = next_tab_id.max(tab.id.saturating_add(1));
+            tab.for_each_pane(|pane| next_pane_id = next_pane_id.max(pane.id.saturating_add(1)));
+        }
+        WorkspaceRuntime::new(ws.clone(), tabs, next_tab_id, next_pane_id)
+    }
+
     fn active_tab_mut(&mut self) -> Option<&mut TerminalTab> {
-        self.tabs.get_mut(self.active_tab)
+        let ws = self.manager.active_mut()?;
+        ws.tabs.get_mut(ws.active_tab)
     }
 
     fn active_tab(&self) -> Option<&TerminalTab> {
-        self.tabs.get(self.active_tab)
+        let ws = self.manager.active()?;
+        ws.tabs.get(ws.active_tab)
     }
 
     fn drain_pty(&mut self) {
-        for tab in &mut self.tabs {
-            tab.for_each_pane_mut(|pane| pane.drain_pty());
+        for ws in &mut self.manager.workspaces {
+            for tab in &mut ws.tabs {
+                tab.for_each_pane_mut(|pane| pane.drain_pty());
+            }
         }
     }
 
     fn ui_top_bar(&mut self, ui: &mut egui::Ui) {
         let mut close_tab: Option<usize> = None;
+        let mut new_tab_requested = false;
+        let mut toggle_search = false;
+        let mut toggle_history = false;
         ui.horizontal(|ui| {
-            for index in 0..self.tabs.len() {
+            let tab_count = self.manager.active().map(|ws| ws.tabs.len()).unwrap_or(0);
+            for index in 0..tab_count {
                 if self.ui_tab(ui, index) {
                     close_tab = Some(index);
                 }
@@ -219,24 +292,22 @@ impl OrbitApp {
             ui.separator();
 
             if ui.button("+").on_hover_text("New tab").clicked() {
-                self.new_tab();
+                new_tab_requested = true;
             }
             if ui.button("H").on_hover_text("Command history").clicked() {
-                self.history_open = !self.history_open;
+                toggle_history = true;
             }
             if ui.button("F").on_hover_text("Search").clicked() {
-                self.search_open = !self.search_open;
+                toggle_search = true;
             }
 
             ui.separator();
             egui::ComboBox::from_label("Theme")
                 .selected_text(self.theme_name.clone())
                 .show_ui(ui, |ui| {
-                    for name in &self.available_themes {
-                        if ui
-                            .selectable_label(*name == self.theme_name, *name)
-                            .clicked()
-                        {
+                    for index in 0..self.available_themes.len() {
+                        let name = self.available_themes[index];
+                        if ui.selectable_label(name == self.theme_name, name).clicked() {
                             self.theme_name = name.to_string();
                             self.theme = crate::theme::get_theme(&self.theme_name);
                             self.config.theme = self.theme_name.clone();
@@ -363,6 +434,15 @@ impl OrbitApp {
             }
         });
 
+        if new_tab_requested {
+            self.new_tab();
+        }
+        if toggle_history {
+            self.history_open = !self.history_open;
+        }
+        if toggle_search {
+            self.search_open = !self.search_open;
+        }
         if let Some(index) = close_tab {
             self.close_tab(index);
         }
@@ -372,8 +452,15 @@ impl OrbitApp {
     /// the active tab and a per-tab close button. Returns `true` when this
     /// tab's close button was clicked.
     fn ui_tab(&mut self, ui: &mut egui::Ui, index: usize) -> bool {
-        let selected = index == self.active_tab;
-        let title = self.tabs[index].title.clone();
+        let (selected, title) = {
+            let Some(ws) = self.manager.active() else {
+                return false;
+            };
+            if index >= ws.tabs.len() {
+                return false;
+            }
+            (ws.active_tab == index, ws.tabs[index].title.clone())
+        };
         let theme = self.theme.clone();
         let appearance = self.config.appearance.clone();
         let radius = appearance.panel_radius.clamp(0.0, 12.0) as u8;
@@ -389,7 +476,9 @@ impl OrbitApp {
             ui.allocate_exact_size(egui::vec2(width.max(24.0), height), egui::Sense::click());
 
         if response.clicked() {
-            self.active_tab = index;
+            if let Some(ws) = self.manager.active_mut() {
+                ws.active_tab = index;
+            }
         }
 
         let hovered = response.hovered();
@@ -463,6 +552,517 @@ impl OrbitApp {
         }
 
         closed
+    }
+
+    /// Workspace selector row: one chip per workspace plus a "new workspace"
+    /// button. Chips can be right-clicked for rename/duplicate/delete/
+    /// reorder/default actions.
+    fn ui_workspace_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Workspaces")
+                    .small()
+                    .color(self.theme.ui.secondary_text),
+            );
+            ui.separator();
+            for index in 0..self.manager.workspaces.len() {
+                self.ui_workspace_chip(ui, index);
+            }
+            ui.separator();
+            if ui
+                .button("+")
+                .on_hover_text("New workspace (Ctrl+Shift+P)")
+                .clicked()
+            {
+                self.open_create_dialog();
+            }
+        });
+    }
+
+    fn ui_workspace_chip(&mut self, ui: &mut egui::Ui, index: usize) {
+        if index >= self.manager.workspaces.len() {
+            return;
+        }
+        let (selected, data) = {
+            let ws = &self.manager.workspaces[index];
+            (index == self.manager.active, ws.data.clone())
+        };
+        let is_default = data.id == self.manager.default_id;
+        let theme = self.theme.clone();
+        let appearance = self.config.appearance.clone();
+        let radius = appearance.panel_radius.clamp(0.0, 12.0) as u8;
+
+        let label = if is_default {
+            format!("★ {} {}", data.icon, data.name)
+        } else {
+            format!("{} {}", data.icon, data.name)
+        };
+        let font_id = egui::TextStyle::Body.resolve(ui.style());
+        let text_size = ui
+            .fonts(|fonts| fonts.layout_no_wrap(label.clone(), font_id.clone(), theme.ui.text))
+            .size();
+        let height = 24.0;
+        let width = text_size.x + 16.0;
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(width.max(20.0), height), egui::Sense::click());
+
+        if response.clicked() {
+            self.manager.switch_to(index);
+            self.persist_config();
+        }
+
+        let hovered = response.hovered();
+        let fill = if selected {
+            theme.ui.tab_active
+        } else if hovered {
+            lerp_color(theme.ui.tab_inactive, theme.ui.tab_active, 0.45)
+        } else {
+            theme.ui.tab_inactive
+        };
+        ui.painter().rect_filled(rect, radius, fill);
+        ui.painter().rect_stroke(
+            rect,
+            radius,
+            egui::Stroke::new(1.0_f32, theme.ui.divider),
+            egui::StrokeKind::Inside,
+        );
+        if selected {
+            ui.painter().rect_filled(
+                egui::Rect::from_min_max(
+                    rect.left_bottom() - egui::vec2(0.0, 2.0),
+                    rect.right_bottom(),
+                ),
+                1.0,
+                theme.ui.accent,
+            );
+        }
+        let text_color = if selected {
+            theme.ui.text
+        } else {
+            theme.ui.secondary_text
+        };
+        ui.painter().text(
+            rect.left_top() + egui::vec2(6.0, (height - text_size.y) / 2.0),
+            egui::Align2::LEFT_TOP,
+            label,
+            font_id,
+            text_color,
+        );
+
+        response.context_menu(|ui| {
+            ui.set_min_width(180.0);
+            ui.label(
+                egui::RichText::new(&data.name)
+                    .strong()
+                    .color(theme.ui.secondary_text),
+            );
+            ui.separator();
+            if ui.button("Rename…").clicked() {
+                self.open_rename_dialog(index);
+                ui.close();
+            }
+            if ui.button("Duplicate").clicked() {
+                self.duplicate_workspace(index);
+                ui.close();
+            }
+            if ui.button("Delete").clicked() {
+                self.delete_workspace(index);
+                ui.close();
+            }
+            ui.separator();
+            if ui
+                .add_enabled(index > 0, egui::Button::new("Move left"))
+                .clicked()
+            {
+                self.manager.move_left(index);
+                self.persist_config();
+                ui.close();
+            }
+            if ui
+                .add_enabled(
+                    index + 1 < self.manager.workspaces.len(),
+                    egui::Button::new("Move right"),
+                )
+                .clicked()
+            {
+                self.manager.move_right(index);
+                self.persist_config();
+                ui.close();
+            }
+            ui.separator();
+            if !is_default && ui.button("Set as default").clicked() {
+                self.manager.set_default(index);
+                self.persist_config();
+                ui.close();
+            }
+        });
+    }
+
+    fn open_create_dialog(&mut self) {
+        let dir = self
+            .manager
+            .active()
+            .map(|ws| ws.data.working_dir.clone())
+            .unwrap_or_else(|| self.config.working_dir.clone());
+        self.workspace_dialog = Some(WorkspaceDialog::Create {
+            name: String::new(),
+            preset: WorkspacePreset::Coding,
+            dir: dir.to_string_lossy().into_owned(),
+        });
+    }
+
+    fn open_rename_dialog(&mut self, index: usize) {
+        let Some(ws) = self.manager.workspaces.get(index) else {
+            return;
+        };
+        self.workspace_dialog = Some(WorkspaceDialog::Rename {
+            id: ws.data.id.clone(),
+            name: ws.data.name.clone(),
+        });
+    }
+
+    fn ui_workspace_dialog(&mut self, ctx: &egui::Context) {
+        let mut collect: Option<(String, WorkspacePreset, String)> = None;
+        let mut rename_target: Option<String> = None;
+        let mut close = false;
+
+        match &mut self.workspace_dialog {
+            Some(WorkspaceDialog::Create { name, preset, dir }) => {
+                let mut open = true;
+                let mut submit = false;
+                let mut closed = false;
+                egui::Window::new("New workspace")
+                    .open(&mut open)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .collapsible(false)
+                    .resizable(false)
+                    .show(ctx, |ui| {
+                        ui.set_min_width(360.0);
+                        ui.label("Name");
+                        ui.text_edit_singleline(name);
+                        ui.label("Preset");
+                        egui::ComboBox::from_id_salt("workspace_create_preset")
+                            .selected_text(preset.label())
+                            .show_ui(ui, |ui| {
+                                for candidate in WorkspacePreset::CREATABLE {
+                                    if ui
+                                        .selectable_label(*preset == candidate, candidate.label())
+                                        .clicked()
+                                    {
+                                        *preset = candidate;
+                                    }
+                                }
+                            });
+                        ui.label(
+                            egui::RichText::new(preset.purpose())
+                                .small()
+                                .color(self.theme.ui.secondary_text),
+                        );
+                        ui.label("Directory");
+                        ui.text_edit_singleline(dir);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(!name.trim().is_empty(), egui::Button::new("Create"))
+                                .clicked()
+                            {
+                                submit = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                closed = true;
+                            }
+                        });
+                        ui.label(
+                            egui::RichText::new(
+                                "Missing directories fall back to your home directory.",
+                            )
+                            .small()
+                            .color(self.theme.ui.secondary_text),
+                        );
+                    });
+                if closed {
+                    open = false;
+                }
+                if submit {
+                    collect = Some((name.clone(), *preset, dir.clone()));
+                }
+                if !open {
+                    close = true;
+                }
+            }
+            Some(WorkspaceDialog::Rename { id, name }) => {
+                let mut open = true;
+                let mut submit = false;
+                let mut closed = false;
+                egui::Window::new("Rename workspace")
+                    .open(&mut open)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .collapsible(false)
+                    .resizable(false)
+                    .show(ctx, |ui| {
+                        ui.set_min_width(300.0);
+                        ui.label("Name");
+                        ui.text_edit_singleline(name);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(!name.trim().is_empty(), egui::Button::new("Rename"))
+                                .clicked()
+                            {
+                                submit = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                closed = true;
+                            }
+                        });
+                    });
+                if closed {
+                    open = false;
+                }
+                if submit {
+                    rename_target = Some(id.clone());
+                }
+                if !open {
+                    close = true;
+                }
+            }
+            None => return,
+        }
+
+        if let Some((name, preset, dir)) = collect {
+            self.create_workspace(name, preset, dir);
+            close = true;
+        }
+        if let Some(id) = rename_target {
+            if let Some(dialog) = &self.workspace_dialog {
+                if let WorkspaceDialog::Rename { name, .. } = dialog {
+                    if self.manager.rename(&id, name) {
+                        self.persist_config();
+                        close = true;
+                    }
+                }
+            }
+        }
+        if close {
+            self.workspace_dialog = None;
+        }
+    }
+
+    fn create_workspace(&mut self, name: String, preset: WorkspacePreset, dir: String) {
+        let working_dir = resolve_dir_input(&dir, &self.config.working_dir);
+        let mut ws = Workspace::from_preset(preset, working_dir, new_id("ws"));
+        let name = name.trim().to_owned();
+        ws.name = if name.is_empty() {
+            preset.label().to_owned()
+        } else {
+            name
+        };
+        let runtime = Self::build_runtime(&self.config, &ws);
+        let _ = self.manager.create(runtime);
+        self.persist_config();
+    }
+
+    fn duplicate_workspace(&mut self, index: usize) {
+        let config = self.config.clone();
+        self.manager
+            .duplicate(index, |ws| Self::build_runtime(&config, ws));
+        self.persist_config();
+    }
+
+    fn delete_workspace(&mut self, index: usize) {
+        let config = self.config.clone();
+        self.manager
+            .delete(index, |ws| Self::build_runtime(&config, ws));
+        self.persist_config();
+    }
+
+    fn palette_items(&self) -> Vec<(String, PaletteAction)> {
+        let mut items = Vec::new();
+        for (index, ws) in self.manager.workspaces.iter().enumerate() {
+            items.push((
+                format!("Workspace: Switch to {}", ws.data.name),
+                PaletteAction::SwitchToWorkspace(index),
+            ));
+        }
+        items.push((
+            "Workspace: Next".to_owned(),
+            PaletteAction::App(AppAction::NextWorkspace),
+        ));
+        items.push((
+            "Workspace: Previous".to_owned(),
+            PaletteAction::App(AppAction::PreviousWorkspace),
+        ));
+        items.push(("Workspace: New".to_owned(), PaletteAction::NewWorkspace));
+        items.push((
+            "Workspace: Rename".to_owned(),
+            PaletteAction::RenameWorkspace,
+        ));
+        items.push((
+            "Workspace: Duplicate".to_owned(),
+            PaletteAction::DuplicateWorkspace,
+        ));
+        items.push((
+            "Workspace: Delete".to_owned(),
+            PaletteAction::DeleteWorkspace,
+        ));
+        for (index, ws) in self.manager.workspaces.iter().enumerate() {
+            items.push((
+                format!("Workspace: Set default: {}", ws.data.name),
+                PaletteAction::SetDefaultWorkspace(index),
+            ));
+        }
+        items.push(("Workspace: Save".to_owned(), PaletteAction::SaveWorkspace));
+        items.push((
+            "Terminal: New tab".to_owned(),
+            PaletteAction::App(AppAction::NewTab),
+        ));
+        items.push((
+            "Terminal: Close tab".to_owned(),
+            PaletteAction::App(AppAction::CloseTab),
+        ));
+        items.push((
+            "Terminal: Next tab".to_owned(),
+            PaletteAction::App(AppAction::NextTab),
+        ));
+        items.push((
+            "Terminal: Previous tab".to_owned(),
+            PaletteAction::App(AppAction::PreviousTab),
+        ));
+        items.push((
+            "Terminal: Split horizontal".to_owned(),
+            PaletteAction::App(AppAction::SplitHorizontal),
+        ));
+        items.push((
+            "Terminal: Split vertical".to_owned(),
+            PaletteAction::App(AppAction::SplitVertical),
+        ));
+        items.push((
+            "Terminal: Close pane".to_owned(),
+            PaletteAction::App(AppAction::ClosePane),
+        ));
+        items.push((
+            "Terminal: Restart pane".to_owned(),
+            PaletteAction::App(AppAction::RestartPane),
+        ));
+        items.push((
+            "Terminal: Toggle search".to_owned(),
+            PaletteAction::App(AppAction::ToggleSearch),
+        ));
+        items.push((
+            "Terminal: Toggle history".to_owned(),
+            PaletteAction::App(AppAction::ToggleHistory),
+        ));
+        items
+    }
+
+    fn ui_command_palette(&mut self, ctx: &egui::Context) {
+        if !self.command_palette_open {
+            return;
+        }
+        let items = self.palette_items();
+        let mut open = true;
+        let mut action: Option<PaletteAction> = None;
+        let mut closed_by_key = false;
+
+        egui::Window::new("Command palette")
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_TOP, [0.0, 48.0])
+            .collapsible(false)
+            .resizable(false)
+            .default_width(440.0)
+            .show(ctx, |ui| {
+                let mut filter = self.palette_filter.clone();
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut filter)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Type a command… (Ctrl+Shift+P to close)"),
+                );
+                if self.palette_just_opened {
+                    ctx.memory_mut(|memory| memory.request_focus(response.id));
+                }
+
+                let filtered: Vec<usize> = items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (label, _))| {
+                        filter.is_empty() || label.to_lowercase().contains(&filter.to_lowercase())
+                    })
+                    .map(|(index, _)| index)
+                    .collect();
+
+                let arrow_down = ui.input(|input| input.key_pressed(egui::Key::ArrowDown));
+                let arrow_up = ui.input(|input| input.key_pressed(egui::Key::ArrowUp));
+                if arrow_down && !filtered.is_empty() {
+                    self.palette_selected = (self.palette_selected + 1) % filtered.len();
+                }
+                if arrow_up && !filtered.is_empty() {
+                    self.palette_selected =
+                        (self.palette_selected + filtered.len() - 1) % filtered.len();
+                }
+                self.palette_selected = self.palette_selected.min(filtered.len().saturating_sub(1));
+
+                let enter =
+                    response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                if enter && !filtered.is_empty() {
+                    action = Some(items[filtered[self.palette_selected]].1.clone());
+                }
+
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .max_height(320.0)
+                    .show(ui, |ui| {
+                        for (rank, &item_index) in filtered.iter().enumerate() {
+                            let (label, item_action) = &items[item_index];
+                            let selected = rank == self.palette_selected;
+                            if ui
+                                .selectable_label(selected, label.clone())
+                                .on_hover_text(item_action_label(item_action))
+                                .clicked()
+                            {
+                                action = Some(item_action.clone());
+                            }
+                        }
+                        if filtered.is_empty() {
+                            ui.label("No matching commands.");
+                        }
+                    });
+
+                self.palette_filter = filter;
+            });
+
+        if self.palette_just_opened {
+            self.palette_just_opened = false;
+        }
+        if ui_input_escape(ctx) {
+            closed_by_key = true;
+        }
+        if let Some(action) = action {
+            self.run_palette_action(action, ctx);
+            self.command_palette_open = false;
+        } else if !open || closed_by_key {
+            self.command_palette_open = false;
+        }
+    }
+
+    fn run_palette_action(&mut self, action: PaletteAction, ctx: &egui::Context) {
+        match action {
+            PaletteAction::App(action) => self.run_action(action, ctx),
+            PaletteAction::SwitchToWorkspace(index) => {
+                self.manager.switch_to(index);
+                self.persist_config();
+            }
+            PaletteAction::NewWorkspace => self.open_create_dialog(),
+            PaletteAction::RenameWorkspace => {
+                if !self.manager.workspaces.is_empty() {
+                    self.open_rename_dialog(self.manager.active);
+                }
+            }
+            PaletteAction::DuplicateWorkspace => self.duplicate_workspace(self.manager.active),
+            PaletteAction::DeleteWorkspace => self.delete_workspace(self.manager.active),
+            PaletteAction::SetDefaultWorkspace(index) => {
+                self.manager.set_default(index);
+                self.persist_config();
+            }
+            PaletteAction::SaveWorkspace => self.persist_config(),
+        }
     }
 
     fn glass_settings_ui(&mut self, ui: &mut egui::Ui) {
@@ -893,12 +1493,16 @@ impl OrbitApp {
     }
 
     fn paint_active_tab(&mut self, ui: &mut egui::Ui) -> egui::Response {
-        // Clone theme before mutably borrowing tabs to avoid borrow conflicts
+        // Clone theme before mutably borrowing workspaces to avoid borrow conflicts
         let theme = self.theme.clone();
         let typography = self.config.typography.clone();
         let glass = self.glass.clone();
         let appearance = self.config.appearance.clone();
-        let Some(tab) = self.active_tab_mut() else {
+        let Some(ws) = self.manager.active_mut() else {
+            let (_, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click());
+            return response;
+        };
+        let Some(tab) = ws.tabs.get_mut(ws.active_tab) else {
             let (_, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click());
             return response;
         };
@@ -1008,8 +1612,27 @@ impl OrbitApp {
         }
     }
 
-    fn persist_config(&self) {
+    fn persist_config(&mut self) {
+        self.sync_workspaces_to_config();
         let _ = self.config.save();
+    }
+
+    /// Mirrors the live workspace state (order, metadata and terminal layouts)
+    /// into the persisted config so the next save captures it.
+    fn sync_workspaces_to_config(&mut self) {
+        self.config.workspaces = self
+            .manager
+            .workspaces
+            .iter()
+            .map(|rt| {
+                let mut data = rt.data.clone();
+                data.active_tab = rt.active_tab;
+                data.tabs = rt.tabs.iter().map(|tab| tab.to_saved()).collect();
+                data
+            })
+            .collect();
+        self.config.active_workspace = self.manager.active_id().unwrap_or_default().to_owned();
+        self.config.default_workspace = self.manager.default_id.clone();
     }
 
     fn run_action(&mut self, action: AppAction, ctx: &egui::Context) {
@@ -1067,78 +1690,135 @@ impl OrbitApp {
                     pane.adjust_scrollback(-20);
                 }
             }
+            AppAction::NextWorkspace => {
+                self.manager.switch_next();
+                self.persist_config();
+            }
+            AppAction::PreviousWorkspace => {
+                self.manager.switch_previous();
+                self.persist_config();
+            }
+            AppAction::ToggleCommandPalette => {
+                self.command_palette_open = !self.command_palette_open;
+                self.palette_just_opened = self.command_palette_open;
+                self.palette_selected = 0;
+                self.palette_filter.clear();
+            }
         }
     }
 
     fn new_tab(&mut self) {
-        let id = self.next_tab_id;
-        self.next_tab_id += 1;
-
-        let pane_id = self.next_pane_id;
-        self.next_pane_id += 1;
-
-        let pane = TerminalPane::new(pane_id, &self.config, self.config.initial_grid);
-        self.tabs.push(TerminalTab {
-            id,
-            title: format!("shell {id}"),
+        let config = self.config.clone();
+        let (tab_id, pane_id, dir) = {
+            let Some(ws) = self.manager.active_mut() else {
+                return;
+            };
+            let dir = resolve_working_dir(&ws.data.working_dir, &config.working_dir);
+            let tab_id = ws.next_tab_id;
+            let pane_id = ws.next_pane_id;
+            ws.next_tab_id += 1;
+            ws.next_pane_id += 1;
+            (tab_id, pane_id, dir)
+        };
+        let pane = TerminalPane::new(
+            pane_id,
+            &config,
+            config.initial_grid,
+            dir,
+            format!("shell {pane_id}"),
+        );
+        let tab = TerminalTab {
+            id: tab_id,
+            title: format!("shell {tab_id}"),
             panes: PaneLayout::Single(pane),
             active_pane: pane_id,
-        });
-        self.active_tab = self.tabs.len().saturating_sub(1);
+        };
+        if let Some(ws) = self.manager.active_mut() {
+            ws.tabs.push(tab);
+            ws.active_tab = ws.tabs.len() - 1;
+        }
+        self.persist_config();
     }
 
     fn close_active_tab(&mut self) {
-        if self.tabs.len() <= 1 {
+        let last = self.manager.active().is_some_and(|ws| ws.tabs.len() <= 1);
+        if last {
             self.restart_active_pane();
             return;
         }
-
-        self.tabs.remove(self.active_tab);
-        self.active_tab = self.active_tab.min(self.tabs.len().saturating_sub(1));
+        if let Some(ws) = self.manager.active_mut() {
+            ws.tabs.remove(ws.active_tab);
+            ws.active_tab = ws.active_tab.min(ws.tabs.len() - 1);
+        }
+        self.persist_config();
     }
 
     /// Closes the tab at `index` (used by the per-tab close button). Closing
     /// the last tab restarts its pane instead, like `close_active_tab`.
     fn close_tab(&mut self, index: usize) {
-        if self.tabs.len() <= 1 {
+        let last = self.manager.active().is_some_and(|ws| ws.tabs.len() <= 1);
+        if last {
             self.restart_active_pane();
             return;
         }
-
-        self.tabs.remove(index);
-        if index < self.active_tab {
-            self.active_tab -= 1;
+        if let Some(ws) = self.manager.active_mut() {
+            if index < ws.tabs.len() {
+                ws.tabs.remove(index);
+                if index < ws.active_tab {
+                    ws.active_tab -= 1;
+                }
+                ws.active_tab = ws.active_tab.min(ws.tabs.len() - 1);
+            }
         }
-        self.active_tab = self.active_tab.min(self.tabs.len().saturating_sub(1));
+        self.persist_config();
     }
 
     fn select_next_tab(&mut self) {
-        if self.tabs.is_empty() {
-            return;
+        if let Some(ws) = self.manager.active_mut() {
+            if ws.tabs.is_empty() {
+                return;
+            }
+            ws.active_tab = (ws.active_tab + 1) % ws.tabs.len();
         }
-        self.active_tab = (self.active_tab + 1) % self.tabs.len();
     }
 
     fn select_previous_tab(&mut self) {
-        if self.tabs.is_empty() {
-            return;
+        if let Some(ws) = self.manager.active_mut() {
+            if ws.tabs.is_empty() {
+                return;
+            }
+            ws.active_tab = if ws.active_tab == 0 {
+                ws.tabs.len() - 1
+            } else {
+                ws.active_tab - 1
+            };
         }
-        self.active_tab = if self.active_tab == 0 {
-            self.tabs.len() - 1
-        } else {
-            self.active_tab - 1
-        };
     }
 
     fn split_active_pane(&mut self, axis: SplitAxis) {
-        let pane_id = self.next_pane_id;
-        self.next_pane_id += 1;
-
         let config = self.config.clone();
-        let Some(tab) = self.active_tab_mut() else {
+        let (pane_id, dir) = {
+            let Some(ws) = self.manager.active_mut() else {
+                return;
+            };
+            let dir = ws
+                .tabs
+                .get(ws.active_tab)
+                .and_then(|tab| tab.active_pane())
+                .map(|pane| pane.working_dir.clone())
+                .unwrap_or_else(|| ws.data.working_dir.clone());
+            let pane_id = ws.next_pane_id;
+            ws.next_pane_id += 1;
+            (pane_id, dir)
+        };
+        let Some(ws) = self.manager.active_mut() else {
             return;
         };
-        tab.split_active(axis, pane_id, &config);
+        let Some(tab) = ws.tabs.get_mut(ws.active_tab) else {
+            return;
+        };
+        tab.split_active(axis, pane_id, &config, dir);
+        self.persist_config();
     }
 
     fn close_active_pane(&mut self) {
@@ -1146,6 +1826,7 @@ impl OrbitApp {
             return;
         };
         tab.close_active_pane();
+        self.persist_config();
     }
 
     fn restart_active_pane(&mut self) {
@@ -1154,10 +1835,13 @@ impl OrbitApp {
             return;
         };
         pane.restart(&config);
+        self.persist_config();
     }
 
     fn active_pane_mut(&mut self) -> Option<&mut TerminalPane> {
-        self.active_tab_mut()?.active_pane_mut()
+        let ws = self.manager.active_mut()?;
+        let tab = ws.tabs.get_mut(ws.active_tab)?;
+        tab.active_pane_mut()
     }
 }
 
@@ -1169,6 +1853,107 @@ impl TerminalTab {
                 f(first);
                 f(second);
             }
+        }
+    }
+
+    fn for_each_pane(&self, mut f: impl FnMut(&TerminalPane)) {
+        match &self.panes {
+            PaneLayout::Single(pane) => f(pane),
+            PaneLayout::Split { first, second, .. } => {
+                f(first);
+                f(second);
+            }
+        }
+    }
+
+    /// Builds a live tab from a saved one, resolving each pane's working
+    /// directory safely (pane dir → workspace dir → config dir → home).
+    fn from_saved(saved: &SavedTab, ws: &Workspace, config: &TerminalConfig) -> Self {
+        let panes = Self::saved_layout(&saved.panes, ws, config);
+        Self {
+            id: saved.id,
+            title: saved.title.clone(),
+            panes,
+            active_pane: saved.active_pane,
+        }
+    }
+
+    fn saved_layout(
+        saved: &SavedPaneLayout,
+        ws: &Workspace,
+        config: &TerminalConfig,
+    ) -> PaneLayout {
+        match saved {
+            SavedPaneLayout::Single(pane) => PaneLayout::Single(Self::saved_pane(pane, ws, config)),
+            SavedPaneLayout::Split {
+                axis,
+                first,
+                second,
+            } => PaneLayout::Split {
+                axis: *axis,
+                first: Self::saved_pane(first, ws, config),
+                second: Self::saved_pane(second, ws, config),
+            },
+        }
+    }
+
+    fn saved_pane(pane: &SavedPane, ws: &Workspace, config: &TerminalConfig) -> TerminalPane {
+        let dir = if pane.working_dir.is_dir() {
+            pane.working_dir.clone()
+        } else {
+            resolve_working_dir(&ws.working_dir, &config.working_dir)
+        };
+        TerminalPane::new(
+            pane.id,
+            config,
+            config.initial_grid,
+            dir,
+            pane.title.clone(),
+        )
+    }
+
+    /// Builds a default single-pane tab for a workspace without saved tabs.
+    fn build_default(ws: &Workspace, config: &TerminalConfig) -> Self {
+        let dir = resolve_working_dir(&ws.working_dir, &config.working_dir);
+        let pane = TerminalPane::new(1, config, config.initial_grid, dir, "shell 1".to_owned());
+        Self {
+            id: 1,
+            title: "shell 1".to_owned(),
+            panes: PaneLayout::Single(pane),
+            active_pane: 1,
+        }
+    }
+
+    /// Serializes the live tab into the persisted model.
+    fn to_saved(&self) -> SavedTab {
+        SavedTab {
+            id: self.id,
+            title: self.title.clone(),
+            active_pane: self.active_pane,
+            panes: Self::layout_to_saved(&self.panes),
+        }
+    }
+
+    fn layout_to_saved(layout: &PaneLayout) -> SavedPaneLayout {
+        match layout {
+            PaneLayout::Single(pane) => SavedPaneLayout::Single(Self::pane_to_saved(pane)),
+            PaneLayout::Split {
+                axis,
+                first,
+                second,
+            } => SavedPaneLayout::Split {
+                axis: *axis,
+                first: Self::pane_to_saved(first),
+                second: Self::pane_to_saved(second),
+            },
+        }
+    }
+
+    fn pane_to_saved(pane: &TerminalPane) -> SavedPane {
+        SavedPane {
+            id: pane.id,
+            title: pane.title.clone(),
+            working_dir: pane.working_dir.clone(),
         }
     }
 
@@ -1318,17 +2103,24 @@ impl TerminalTab {
         }
     }
 
-    fn split_active(&mut self, axis: SplitAxis, pane_id: usize, config: &TerminalConfig) {
+    fn split_active(
+        &mut self,
+        axis: SplitAxis,
+        pane_id: usize,
+        config: &TerminalConfig,
+        working_dir: PathBuf,
+    ) {
         let PaneLayout::Single(existing) = &self.panes else {
             self.active_pane = self.inactive_pane_id().unwrap_or(self.active_pane);
             return;
         };
 
         let grid = existing.last_grid;
-        let new_pane = TerminalPane::new(pane_id, config, grid);
+        let title = existing.title.clone();
+        let new_pane = TerminalPane::new(pane_id, config, grid, working_dir.clone(), title);
         let old = match std::mem::replace(
             &mut self.panes,
-            PaneLayout::Single(TerminalPane::new(pane_id + 1, config, grid)),
+            PaneLayout::Single(TerminalPane::placeholder(pane_id + 1)),
         ) {
             PaneLayout::Single(pane) => pane,
             PaneLayout::Split { .. } => unreachable!(),
@@ -1401,14 +2193,23 @@ impl TerminalTab {
 }
 
 impl TerminalPane {
-    fn new(id: usize, config: &TerminalConfig, grid: TerminalGrid) -> Self {
+    fn new(
+        id: usize,
+        config: &TerminalConfig,
+        grid: TerminalGrid,
+        working_dir: PathBuf,
+        title: String,
+    ) -> Self {
         let mut pane_config = config.clone();
         pane_config.initial_grid = grid;
+        pane_config.working_dir = working_dir.clone();
         let terminal = TerminalState::new(grid, pane_config.scrollback_lines);
         let pty = PtySession::spawn(pane_config).map_err(|err| err.to_string());
 
         Self {
             id,
+            title,
+            working_dir,
             terminal,
             pty,
             last_grid: grid,
@@ -1427,6 +2228,8 @@ impl TerminalPane {
         let grid = TerminalGrid { rows: 1, cols: 1 };
         Self {
             id,
+            title: String::new(),
+            working_dir: PathBuf::new(),
             terminal: TerminalState::new(grid, 0),
             pty: Err("placeholder".to_owned()),
             last_grid: grid,
@@ -1444,12 +2247,10 @@ impl TerminalPane {
     fn restart(&mut self, config: &TerminalConfig) {
         let grid = self.last_grid;
         self.terminal = TerminalState::new(grid, config.scrollback_lines);
-        self.pty = PtySession::spawn({
-            let mut pane_config = config.clone();
-            pane_config.initial_grid = grid;
-            pane_config
-        })
-        .map_err(|err| err.to_string());
+        let mut pane_config = config.clone();
+        pane_config.initial_grid = grid;
+        pane_config.working_dir = self.working_dir.clone();
+        self.pty = PtySession::spawn(pane_config).map_err(|err| err.to_string());
         self.scrollback_rows = 0;
         self.selection = None;
         self.search_current = None;
@@ -2033,6 +2834,8 @@ impl eframe::App for OrbitApp {
             )
             .show(ctx, |ui| {
                 self.ui_top_bar(ui);
+                ui.add_space(2.0);
+                self.ui_workspace_bar(ui);
                 self.ui_search_bar(ui);
             });
 
@@ -2047,6 +2850,9 @@ impl eframe::App for OrbitApp {
         }
 
         self.ui_history_panel(ctx);
+
+        self.ui_workspace_dialog(ctx);
+        self.ui_command_palette(ctx);
 
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(self.glass_background()))
@@ -2117,14 +2923,18 @@ fn action_from_event(event: &egui::Event) -> Option<AppAction> {
             egui::Key::X => Some(AppAction::ClosePane),
             egui::Key::Tab => Some(AppAction::PreviousTab),
             egui::Key::C => Some(AppAction::CopySelection), // Ctrl+Shift+C for copy
+            egui::Key::P => Some(AppAction::ToggleCommandPalette),
             _ => None,
         };
     }
 
     // Plain Ctrl shortcuts should be forwarded to the terminal where appropriate.
-    // We still capture Ctrl+Tab for tab switching and Ctrl+Shift handled above.
+    // We still capture Ctrl+Tab for tab switching and Ctrl+PageUp/PageDown for
+    // workspace switching.
     match key {
         egui::Key::Tab => Some(AppAction::NextTab),
+        egui::Key::PageDown => Some(AppAction::NextWorkspace),
+        egui::Key::PageUp => Some(AppAction::PreviousWorkspace),
         _ => None,
     }
 }
@@ -2300,5 +3110,32 @@ fn format_age(duration: Duration) -> String {
         format!("{}m ago", seconds / 60)
     } else {
         format!("{}h ago", seconds / 3600)
+    }
+}
+
+fn ui_input_escape(ctx: &egui::Context) -> bool {
+    ctx.input(|input| input.key_pressed(egui::Key::Escape))
+}
+
+fn item_action_label(action: &PaletteAction) -> &'static str {
+    match action {
+        PaletteAction::App(AppAction::NewTab) => "Open a new terminal tab",
+        PaletteAction::App(AppAction::CloseTab) => "Close the active tab",
+        PaletteAction::App(AppAction::NextTab) => "Go to the next tab",
+        PaletteAction::App(AppAction::PreviousTab) => "Go to the previous tab",
+        PaletteAction::App(AppAction::SplitHorizontal) => "Split the active pane horizontally",
+        PaletteAction::App(AppAction::SplitVertical) => "Split the active pane vertically",
+        PaletteAction::App(AppAction::ClosePane) => "Close the active pane",
+        PaletteAction::App(AppAction::RestartPane) => "Restart the active pane's shell",
+        PaletteAction::App(AppAction::ToggleSearch) => "Open or close the search bar",
+        PaletteAction::App(AppAction::ToggleHistory) => "Open or close the command history panel",
+        PaletteAction::App(_) => "",
+        PaletteAction::SwitchToWorkspace(_) => "Switch to this workspace",
+        PaletteAction::NewWorkspace => "Create a new workspace",
+        PaletteAction::RenameWorkspace => "Rename the active workspace",
+        PaletteAction::DuplicateWorkspace => "Duplicate the active workspace",
+        PaletteAction::DeleteWorkspace => "Delete the active workspace",
+        PaletteAction::SetDefaultWorkspace(_) => "Mark this workspace as default",
+        PaletteAction::SaveWorkspace => "Save the current workspace state",
     }
 }
