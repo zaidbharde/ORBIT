@@ -1,5 +1,4 @@
 use crate::terminal::TerminalGrid;
-use crate::workspace::Workspace;
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -625,13 +624,9 @@ pub struct TerminalConfig {
     pub typography: TypographyConfig,
     pub glass: GlassConfig,
     pub appearance: AppearanceConfig,
-    /// Saved workspaces (metadata plus serialized layouts). Order is the
-    /// user-visible workspace order.
-    pub workspaces: Vec<Workspace>,
-    /// Id of the workspace that was active on the last run.
-    pub active_workspace: String,
-    /// Id of the workspace marked as default.
-    pub default_workspace: String,
+    /// Id of the section that was active on the last run ("terminal" by
+    /// default). Invalid ids fall back to the Terminal section on startup.
+    pub active_section: String,
 }
 
 impl Default for TerminalConfig {
@@ -645,9 +640,7 @@ impl Default for TerminalConfig {
             typography: TypographyConfig::default(),
             glass: GlassConfig::default(),
             appearance: AppearanceConfig::default(),
-            workspaces: Vec::new(),
-            active_workspace: String::new(),
-            default_workspace: String::new(),
+            active_section: "terminal".to_owned(),
         }
     }
 }
@@ -791,6 +784,22 @@ mod tests {
         let loaded: TerminalConfig = toml::from_str(payload).unwrap();
         assert_eq!(loaded.appearance, AppearanceConfig::default());
         assert_eq!(loaded.theme, "frost");
+    }
+
+    #[test]
+    fn active_section_round_trips_through_toml() {
+        let mut config = TerminalConfig::default();
+        config.active_section = "devops".to_owned();
+        let payload = toml::to_string(&config).unwrap();
+        let loaded: TerminalConfig = toml::from_str(&payload).unwrap();
+        assert_eq!(loaded.active_section, "devops");
+    }
+
+    #[test]
+    fn missing_active_section_falls_back_to_terminal() {
+        let payload = "shell = \"/bin/bash\"\ntheme = \"frost\"\n";
+        let loaded: TerminalConfig = toml::from_str(payload).unwrap();
+        assert_eq!(loaded.active_section, "terminal");
     }
 
     #[test]
