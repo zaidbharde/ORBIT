@@ -1,4 +1,5 @@
 use super::placeholder::PlaceholderSection;
+use super::system::SystemSection;
 use super::terminal_section::TerminalSection;
 use super::{Section, SectionId};
 use crate::config::TerminalConfig;
@@ -15,9 +16,10 @@ pub struct SectionRegistry {
 }
 
 impl SectionRegistry {
-    /// Builds the registry with a real Terminal section plus the built-in
-    /// placeholder sections, restoring the last active section from config.
-    /// Invalid persisted ids fall back to Terminal.
+    /// Builds the registry with a real Terminal section, the placeholder
+    /// sections for the remaining tool categories, and the live System
+    /// section, restoring the last active section from config. Invalid
+    /// persisted ids fall back to Terminal.
     pub fn new(config: &TerminalConfig) -> Self {
         Self::with_terminal_builder(config, |config| Box::new(TerminalSection::new(config)))
     }
@@ -30,9 +32,15 @@ impl SectionRegistry {
     ) -> Self {
         let mut sections: Vec<Box<dyn Section>> = Vec::new();
         sections.push(build_terminal(config));
-        for id in SectionId::ALL.iter().skip(1).copied() {
+        for id in [
+            SectionId::Coding,
+            SectionId::Networking,
+            SectionId::Cybersecurity,
+            SectionId::DevOps,
+        ] {
             sections.push(Box::new(PlaceholderSection::new(id)));
         }
+        sections.push(Box::new(SystemSection::new()));
 
         let active = SectionId::from_config_id(&config.active_section)
             .index()

@@ -1,5 +1,6 @@
 pub mod placeholder;
 pub mod registry;
+pub mod system;
 pub mod terminal_section;
 
 use crate::config::{AppearanceConfig, GlassConfig, TypographyConfig};
