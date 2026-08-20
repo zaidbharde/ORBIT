@@ -1,14 +1,17 @@
-//! System section: static system information plus live CPU and RAM
-//! monitoring at ~1 Hz, all sourced from Linux `/proc` (no external
-//! dependencies). Metrics are collected in `update()` — the dashboard
-//! render path only reads cached values.
+//! System section: static system information plus live CPU, RAM and GPU
+//! monitoring at ~1 Hz. CPU/RAM come from Linux `/proc` (no external
+//! dependencies); GPU telemetry comes from the read-only NVIDIA backend in
+//! [`gpu`]. Metrics are collected in `update()` — the dashboard render
+//! path only reads cached values.
 
 pub mod dashboard;
+pub mod gpu;
 pub mod metrics;
 
 use super::{Section, SectionContext, SectionId};
 use crate::theme::Theme;
 use eframe::egui;
+use gpu::GpuMonitor;
 use metrics::{
     CpuTicks, SystemInfo, SystemMetrics, collect_system_info, cpu_usage_delta, read_cpu_ticks,
     read_memory_kib, read_uptime_secs,
@@ -27,9 +30,12 @@ pub const HISTORY_LEN: usize = 60;
 pub struct SystemSection {
     info: SystemInfo,
     metrics: SystemMetrics,
+    gpu: GpuMonitor,
     prev_cpu: Option<CpuTicks>,
     cpu_history: VecDeque<f32>,
     ram_history: VecDeque<f32>,
+    gpu_history: VecDeque<f32>,
+    vram_history: VecDeque<f32>,
     last_collect: Option<Instant>,
 }
 
@@ -38,9 +44,12 @@ impl SystemSection {
         Self {
             info: collect_system_info(),
             metrics: SystemMetrics::default(),
+            gpu: GpuMonitor::new(),
             prev_cpu: None,
             cpu_history: VecDeque::with_capacity(HISTORY_LEN),
             ram_history: VecDeque::with_capacity(HISTORY_LEN),
+            gpu_history: VecDeque::with_capacity(HISTORY_LEN),
+            vram_history: VecDeque::with_capacity(HISTORY_LEN),
             last_collect: None,
         }
     }
@@ -71,6 +80,16 @@ impl SystemSection {
             self.metrics.memory_available = Some(available);
             self.metrics.memory_usage = Some(usage);
             push_history(&mut self.ram_history, usage);
+        }
+
+        self.gpu.poll();
+        if let Some(primary) = self.gpu.primary() {
+            if let Some(utilization) = primary.utilization {
+                push_history(&mut self.gpu_history, utilization);
+            }
+            if let Some(fraction) = primary.memory_fraction() {
+                push_history(&mut self.vram_history, fraction * 100.0);
+            }
         }
 
         self.metrics.uptime_secs = read_uptime_secs();
@@ -104,6 +123,8 @@ impl Section for SystemSection {
     fn render(&mut self, ui: &mut egui::Ui, context: &SectionContext<'_>) -> egui::Response {
         let cpu_history = self.cpu_history.make_contiguous();
         let ram_history = self.ram_history.make_contiguous();
+        let gpu_history = self.gpu_history.make_contiguous();
+        let vram_history = self.vram_history.make_contiguous();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -114,6 +135,9 @@ impl Section for SystemSection {
                     &self.metrics,
                     cpu_history,
                     ram_history,
+                    &self.gpu,
+                    gpu_history,
+                    vram_history,
                 );
                 ui.response()
             })
@@ -149,5 +173,7 @@ mod tests {
         section.collect();
         assert!(section.cpu_history.len() <= HISTORY_LEN);
         assert!(section.ram_history.len() <= HISTORY_LEN);
+        assert!(section.gpu_history.len() <= HISTORY_LEN);
+        assert!(section.vram_history.len() <= HISTORY_LEN);
     }
 }

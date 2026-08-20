@@ -6,6 +6,7 @@
 //! section's update loop, never here.
 
 use super::HISTORY_LEN;
+use super::gpu::{GpuBackend, GpuInfo, GpuMonitor};
 use super::metrics::{SystemInfo, SystemMetrics};
 use crate::glass::with_alpha;
 use crate::section::SectionContext;
@@ -23,13 +24,19 @@ pub fn show(
     metrics: &SystemMetrics,
     cpu_history: &[f32],
     ram_history: &[f32],
+    gpu: &GpuMonitor,
+    gpu_history: &[f32],
+    vram_history: &[f32],
 ) {
     ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
     ui.columns(2, |columns| {
         cpu_card(&mut columns[0], context, metrics, cpu_history);
         memory_card(&mut columns[1], context, metrics, ram_history);
     });
-    info_card(ui, context, info, metrics);
+    ui.columns(2, |columns| {
+        gpu_card(&mut columns[0], context, gpu, gpu_history, vram_history);
+        info_card(&mut columns[1], context, info, metrics);
+    });
 }
 
 fn card(ui: &mut Ui, context: &SectionContext<'_>, title: &str, add: impl FnOnce(&mut Ui)) {
@@ -188,6 +195,240 @@ fn memory_card(
             }
             _ => {
                 ui.label(RichText::new("Unavailable").color(theme.ui.secondary_text));
+            }
+        }
+    });
+}
+
+fn gpu_card(
+    ui: &mut Ui,
+    context: &SectionContext<'_>,
+    monitor: &GpuMonitor,
+    gpu_history: &[f32],
+    vram_history: &[f32],
+) {
+    let theme = context.theme;
+    let title = if monitor.backend() == GpuBackend::Nvidia {
+        format!("GPU · {}", monitor.backend().label())
+    } else {
+        "GPU".to_owned()
+    };
+    card(ui, context, &title, |ui| {
+        let gpus = monitor.gpus();
+        if gpus.is_empty() {
+            ui.label(RichText::new("Telemetry unavailable").color(theme.ui.secondary_text));
+            return;
+        }
+        for (index, gpu) in gpus.iter().enumerate() {
+            if index == 0 {
+                primary_gpu(ui, context, gpu, gpu_history, vram_history);
+            } else {
+                ui.add_space(2.0);
+                ui.separator();
+                compact_gpu_row(ui, context, index, gpu);
+            }
+        }
+    });
+}
+
+fn primary_gpu(
+    ui: &mut Ui,
+    context: &SectionContext<'_>,
+    gpu: &GpuInfo,
+    gpu_history: &[f32],
+    vram_history: &[f32],
+) {
+    let theme = context.theme;
+    if let Some(name) = &gpu.name {
+        ui.label(
+            RichText::new(name)
+                .font(FontId::proportional(13.0))
+                .color(theme.ui.text)
+                .strong(),
+        );
+    }
+    let detail = match (&gpu.vendor, &gpu.driver_version) {
+        (Some(vendor), Some(driver)) => format!("{vendor} · Driver {driver}"),
+        (Some(vendor), None) => vendor.clone(),
+        (None, Some(driver)) => format!("Driver {driver}"),
+        (None, None) => String::new(),
+    };
+    if !detail.is_empty() {
+        ui.label(
+            RichText::new(detail)
+                .font(FontId::proportional(11.0))
+                .color(theme.ui.secondary_text),
+        );
+    }
+    ui.add_space(2.0);
+
+    match gpu.utilization {
+        Some(utilization) => {
+            let color = usage_color(theme, utilization / 100.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("{utilization:.0}%"))
+                        .font(FontId::monospace(22.0))
+                        .color(theme.ui.text),
+                );
+                ui.add_space(6.0);
+                ui.label(RichText::new("gpu usage").color(theme.ui.secondary_text));
+            });
+            usage_bar(ui, context, utilization / 100.0, color);
+            graph(ui, context, gpu_history, color);
+        }
+        None => {
+            stat_line(ui, context, "GPU Usage", None);
+        }
+    }
+
+    match (gpu.memory_used, gpu.memory_total, gpu.memory_fraction()) {
+        (Some(used), Some(total), Some(fraction)) => {
+            let color = usage_color(theme, fraction);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("{} / {}", format_bytes(used), format_bytes(total)))
+                        .font(FontId::monospace(13.0))
+                        .color(theme.ui.text),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!("{:.0}%", fraction * 100.0))
+                        .color(theme.ui.secondary_text),
+                );
+            });
+            usage_bar(ui, context, fraction, color);
+            graph(ui, context, vram_history, color);
+            match gpu.memory_free {
+                Some(free) => {
+                    ui.label(
+                        RichText::new(format!("free {}", format_bytes(free)))
+                            .font(FontId::proportional(11.0))
+                            .color(theme.ui.secondary_text),
+                    );
+                }
+                None => {
+                    stat_line(ui, context, "VRAM free", None);
+                }
+            }
+        }
+        _ => {
+            stat_line(ui, context, "VRAM", None);
+        }
+    }
+
+    stat_line_colored(
+        ui,
+        context,
+        "Temperature",
+        gpu.temperature.map(|value| format!("{value:.0}°C")),
+        gpu.temperature.map_or(theme.ui.secondary_text, |value| {
+            temperature_color(theme, value)
+        }),
+    );
+    let power = match (gpu.power_draw, gpu.power_limit) {
+        (Some(draw), Some(limit)) => Some(format!("{draw:.0} W / {limit:.0} W")),
+        (Some(draw), None) => Some(format!("{draw:.0} W")),
+        (None, Some(limit)) => Some(format!("-- / {limit:.0} W")),
+        (None, None) => None,
+    };
+    stat_line(ui, context, "Power", power);
+    stat_line(
+        ui,
+        context,
+        "Clock",
+        gpu.graphics_clock.map(|value| format!("{value} MHz")),
+    );
+    stat_line(
+        ui,
+        context,
+        "Mem Clock",
+        gpu.memory_clock.map(|value| format!("{value} MHz")),
+    );
+    stat_line(
+        ui,
+        context,
+        "Fan",
+        gpu.fan_speed.map(|value| format!("{value:.0}%")),
+    );
+}
+
+fn compact_gpu_row(ui: &mut Ui, context: &SectionContext<'_>, index: usize, gpu: &GpuInfo) {
+    let theme = context.theme;
+    let name = gpu.name.as_deref().unwrap_or("Unknown GPU");
+    ui.label(
+        RichText::new(format!("GPU {index} · {name}"))
+            .font(FontId::proportional(11.0))
+            .color(theme.ui.secondary_text),
+    );
+    match gpu.utilization {
+        Some(utilization) => {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("{utilization:.0}%"))
+                        .font(FontId::monospace(11.0))
+                        .color(theme.ui.text),
+                );
+                if let Some(temperature) = gpu.temperature {
+                    ui.label(
+                        RichText::new(format!("{temperature:.0}°C"))
+                            .font(FontId::monospace(11.0))
+                            .color(theme.ui.secondary_text),
+                    );
+                }
+            });
+            usage_bar(
+                ui,
+                context,
+                utilization / 100.0,
+                usage_color(theme, utilization / 100.0),
+            );
+        }
+        None => {
+            ui.label(
+                RichText::new("Unavailable")
+                    .font(FontId::proportional(11.0))
+                    .color(theme.status.warning),
+            );
+        }
+    }
+}
+
+fn stat_line(ui: &mut Ui, context: &SectionContext<'_>, label: &str, value: Option<String>) {
+    stat_line_colored(ui, context, label, value, context.theme.ui.text);
+}
+
+fn stat_line_colored(
+    ui: &mut Ui,
+    context: &SectionContext<'_>,
+    label: &str,
+    value: Option<String>,
+    value_color: Color32,
+) {
+    let theme = context.theme;
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            egui::vec2(96.0, 16.0),
+            egui::Label::new(
+                RichText::new(label)
+                    .font(FontId::proportional(11.0))
+                    .color(theme.ui.secondary_text),
+            ),
+        );
+        match value {
+            Some(value) => {
+                ui.label(
+                    RichText::new(value)
+                        .font(FontId::monospace(11.0))
+                        .color(value_color),
+                );
+            }
+            None => {
+                ui.label(
+                    RichText::new("Unavailable")
+                        .font(FontId::proportional(11.0))
+                        .color(theme.status.warning),
+                );
             }
         }
     });
@@ -371,6 +612,19 @@ pub fn usage_color(theme: &Theme, fraction: f32) -> Color32 {
     }
 }
 
+/// Informational color band for GPU temperature in °C — a visual cue based
+/// on typical NVIDIA operating ranges, not a thermal safety claim:
+/// below 70 normal (accent), 70-84 elevated (warning), 85+ high (error).
+pub fn temperature_color(theme: &Theme, celsius: f32) -> Color32 {
+    if celsius >= 85.0 {
+        theme.status.error
+    } else if celsius >= 70.0 {
+        theme.status.warning
+    } else {
+        theme.ui.accent
+    }
+}
+
 /// Human-readable byte size ("1536 B", "1.5 KB", "15.26 GB", ...).
 pub fn format_bytes(bytes: u64) -> String {
     const KB: f64 = 1024.0;
@@ -465,5 +719,16 @@ mod tests {
         assert_eq!(usage_color(&theme, 0.89), theme.ui.accent);
         assert_eq!(usage_color(&theme, 0.9), theme.status.error);
         assert_eq!(usage_color(&theme, 1.0), theme.status.error);
+    }
+
+    #[test]
+    fn temperature_color_bands_normal_elevated_high() {
+        let theme = get_theme("orbit-dark");
+        assert_eq!(temperature_color(&theme, 40.0), theme.ui.accent);
+        assert_eq!(temperature_color(&theme, 69.0), theme.ui.accent);
+        assert_eq!(temperature_color(&theme, 70.0), theme.status.warning);
+        assert_eq!(temperature_color(&theme, 84.0), theme.status.warning);
+        assert_eq!(temperature_color(&theme, 85.0), theme.status.error);
+        assert_eq!(temperature_color(&theme, 95.0), theme.status.error);
     }
 }
