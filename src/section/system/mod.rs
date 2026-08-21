@@ -7,6 +7,7 @@
 pub mod dashboard;
 pub mod gpu;
 pub mod metrics;
+pub mod process;
 pub mod storage;
 
 use super::{Section, SectionContext, SectionId};
@@ -34,6 +35,7 @@ pub struct SystemSection {
     metrics: SystemMetrics,
     gpu: GpuMonitor,
     disk_io: DiskIoMonitor,
+    process_monitor: process::ProcessMonitor,
     prev_cpu: Option<CpuTicks>,
     cpu_history: VecDeque<f32>,
     ram_history: VecDeque<f32>,
@@ -51,6 +53,7 @@ impl SystemSection {
             metrics: SystemMetrics::default(),
             gpu: GpuMonitor::new(),
             disk_io: DiskIoMonitor::new(),
+            process_monitor: process::ProcessMonitor::new(),
             prev_cpu: None,
             cpu_history: VecDeque::with_capacity(HISTORY_LEN),
             ram_history: VecDeque::with_capacity(HISTORY_LEN),
@@ -115,6 +118,9 @@ impl SystemSection {
             self.metrics.disk_io = None;
         }
 
+        self.process_monitor
+            .poll(self.metrics.memory_total.unwrap_or(0));
+
         self.metrics.uptime_secs = read_uptime_secs();
     }
 }
@@ -165,6 +171,7 @@ impl Section for SystemSection {
                     vram_history,
                     read_history,
                     write_history,
+                    &mut self.process_monitor,
                 );
                 ui.response()
             })

@@ -30,6 +30,7 @@ pub fn show(
     vram_history: &[f32],
     read_history: &[f32],
     write_history: &[f32],
+    process_monitor: &mut super::process::ProcessMonitor,
 ) {
     ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
     ui.columns(2, |columns| {
@@ -50,6 +51,7 @@ pub fn show(
             write_history,
         );
     });
+    super::process::show_process_card(ui, context, process_monitor);
 }
 
 fn card(ui: &mut Ui, context: &SectionContext<'_>, title: &str, add: impl FnOnce(&mut Ui)) {
