@@ -7,6 +7,7 @@
 pub mod dashboard;
 pub mod gpu;
 pub mod metrics;
+pub mod network;
 pub mod process;
 pub mod storage;
 
@@ -36,6 +37,7 @@ pub struct SystemSection {
     gpu: GpuMonitor,
     disk_io: DiskIoMonitor,
     process_monitor: process::ProcessMonitor,
+    network: network::NetworkMonitor,
     prev_cpu: Option<CpuTicks>,
     cpu_history: VecDeque<f32>,
     ram_history: VecDeque<f32>,
@@ -54,6 +56,7 @@ impl SystemSection {
             gpu: GpuMonitor::new(),
             disk_io: DiskIoMonitor::new(),
             process_monitor: process::ProcessMonitor::new(),
+            network: network::NetworkMonitor::new(),
             prev_cpu: None,
             cpu_history: VecDeque::with_capacity(HISTORY_LEN),
             ram_history: VecDeque::with_capacity(HISTORY_LEN),
@@ -121,6 +124,8 @@ impl SystemSection {
         self.process_monitor
             .poll(self.metrics.memory_total.unwrap_or(0));
 
+        self.network.poll();
+
         self.metrics.uptime_secs = read_uptime_secs();
     }
 }
@@ -172,6 +177,7 @@ impl Section for SystemSection {
                     read_history,
                     write_history,
                     &mut self.process_monitor,
+                    &mut self.network,
                 );
                 ui.response()
             })

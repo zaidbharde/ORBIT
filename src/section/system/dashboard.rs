@@ -31,6 +31,7 @@ pub fn show(
     read_history: &[f32],
     write_history: &[f32],
     process_monitor: &mut super::process::ProcessMonitor,
+    network_monitor: &mut super::network::NetworkMonitor,
 ) {
     ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
     ui.columns(2, |columns| {
@@ -51,6 +52,7 @@ pub fn show(
             write_history,
         );
     });
+    super::network::show_network_card(ui, context, network_monitor);
     super::process::show_process_card(ui, context, process_monitor);
 }
 
