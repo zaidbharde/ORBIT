@@ -3,6 +3,9 @@ name = "orbit"
 version = "0.1.0"
 edition = "2024"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dependencies]
 ab_glyph = "0.2"
 anyhow = "1.0"

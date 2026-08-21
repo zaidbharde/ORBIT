@@ -7,6 +7,7 @@
 pub mod dashboard;
 pub mod gpu;
 pub mod metrics;
+pub mod storage;
 
 use super::{Section, SectionContext, SectionId};
 use crate::theme::Theme;
@@ -18,6 +19,7 @@ use metrics::{
 };
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
+use storage::DiskIoMonitor;
 
 /// How often dynamic metrics are re-read (1 Hz, well below the 60 fps frame
 /// rate, so the update loop stays lightweight).
@@ -31,11 +33,14 @@ pub struct SystemSection {
     info: SystemInfo,
     metrics: SystemMetrics,
     gpu: GpuMonitor,
+    disk_io: DiskIoMonitor,
     prev_cpu: Option<CpuTicks>,
     cpu_history: VecDeque<f32>,
     ram_history: VecDeque<f32>,
     gpu_history: VecDeque<f32>,
     vram_history: VecDeque<f32>,
+    read_history: VecDeque<f32>,
+    write_history: VecDeque<f32>,
     last_collect: Option<Instant>,
 }
 
@@ -45,11 +50,14 @@ impl SystemSection {
             info: collect_system_info(),
             metrics: SystemMetrics::default(),
             gpu: GpuMonitor::new(),
+            disk_io: DiskIoMonitor::new(),
             prev_cpu: None,
             cpu_history: VecDeque::with_capacity(HISTORY_LEN),
             ram_history: VecDeque::with_capacity(HISTORY_LEN),
             gpu_history: VecDeque::with_capacity(HISTORY_LEN),
             vram_history: VecDeque::with_capacity(HISTORY_LEN),
+            read_history: VecDeque::with_capacity(HISTORY_LEN),
+            write_history: VecDeque::with_capacity(HISTORY_LEN),
             last_collect: None,
         }
     }
@@ -92,6 +100,21 @@ impl SystemSection {
             }
         }
 
+        self.metrics.storage_mounts = storage::collect_storage_mounts();
+
+        self.disk_io.poll();
+        if let Some(io_metrics) = self.disk_io.metrics() {
+            self.metrics.disk_io = Some(io_metrics.clone());
+            if let Some(read) = io_metrics.read_bytes_per_sec {
+                push_history(&mut self.read_history, read);
+            }
+            if let Some(write) = io_metrics.write_bytes_per_sec {
+                push_history(&mut self.write_history, write);
+            }
+        } else {
+            self.metrics.disk_io = None;
+        }
+
         self.metrics.uptime_secs = read_uptime_secs();
     }
 }
@@ -125,6 +148,8 @@ impl Section for SystemSection {
         let ram_history = self.ram_history.make_contiguous();
         let gpu_history = self.gpu_history.make_contiguous();
         let vram_history = self.vram_history.make_contiguous();
+        let read_history = self.read_history.make_contiguous();
+        let write_history = self.write_history.make_contiguous();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -138,6 +163,8 @@ impl Section for SystemSection {
                     &self.gpu,
                     gpu_history,
                     vram_history,
+                    read_history,
+                    write_history,
                 );
                 ui.response()
             })
@@ -175,5 +202,7 @@ mod tests {
         assert!(section.ram_history.len() <= HISTORY_LEN);
         assert!(section.gpu_history.len() <= HISTORY_LEN);
         assert!(section.vram_history.len() <= HISTORY_LEN);
+        assert!(section.read_history.len() <= HISTORY_LEN);
+        assert!(section.write_history.len() <= HISTORY_LEN);
     }
 }

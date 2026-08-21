@@ -1641,6 +1641,7 @@ dependencies = [
  "anyhow",
  "crossbeam-channel",
  "eframe",
+ "libc",
  "portable-pty",
  "raw-window-handle",
  "serde",

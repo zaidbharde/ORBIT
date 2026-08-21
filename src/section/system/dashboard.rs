@@ -8,6 +8,7 @@
 use super::HISTORY_LEN;
 use super::gpu::{GpuBackend, GpuInfo, GpuMonitor};
 use super::metrics::{SystemInfo, SystemMetrics};
+use super::storage::{DiskIoMetrics, StorageMount, THROUGHPUT_FLOOR_BPS};
 use crate::glass::with_alpha;
 use crate::section::SectionContext;
 use crate::theme::Theme;
@@ -27,6 +28,8 @@ pub fn show(
     gpu: &GpuMonitor,
     gpu_history: &[f32],
     vram_history: &[f32],
+    read_history: &[f32],
+    write_history: &[f32],
 ) {
     ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
     ui.columns(2, |columns| {
@@ -36,6 +39,16 @@ pub fn show(
     ui.columns(2, |columns| {
         gpu_card(&mut columns[0], context, gpu, gpu_history, vram_history);
         info_card(&mut columns[1], context, info, metrics);
+    });
+    ui.columns(2, |columns| {
+        storage_card(&mut columns[0], context, &metrics.storage_mounts);
+        disk_activity_card(
+            &mut columns[1],
+            context,
+            metrics.disk_io.as_ref(),
+            read_history,
+            write_history,
+        );
     });
 }
 
@@ -434,6 +447,327 @@ fn stat_line_colored(
     });
 }
 
+fn storage_card(ui: &mut Ui, context: &SectionContext<'_>, mounts: &[StorageMount]) {
+    let theme = context.theme;
+    card(ui, context, "Storage", |ui| {
+        if mounts.is_empty() {
+            ui.label(RichText::new("Telemetry unavailable").color(theme.ui.secondary_text));
+            return;
+        }
+        // Primary mount is `/` if present, otherwise the first entry.
+        let primary_idx = mounts
+            .iter()
+            .position(|m| m.mount_point == "/")
+            .unwrap_or(0);
+        primary_storage(ui, context, &mounts[primary_idx]);
+        for (i, mount) in mounts.iter().enumerate() {
+            if i == primary_idx {
+                continue;
+            }
+            ui.add_space(4.0);
+            ui.separator();
+            compact_storage_row(ui, context, mount);
+        }
+    });
+}
+
+fn primary_storage(ui: &mut Ui, context: &SectionContext<'_>, mount: &StorageMount) {
+    let theme = context.theme;
+    ui.label(
+        RichText::new(&mount.mount_point)
+            .font(FontId::proportional(13.0))
+            .color(theme.ui.text)
+            .strong(),
+    );
+    match mount.usage_fraction() {
+        Some(fraction) => {
+            let color = storage_usage_color(theme, fraction);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("{:.0}%", fraction * 100.0))
+                        .font(FontId::monospace(22.0))
+                        .color(theme.ui.text),
+                );
+                if let Some(total) = mount.total_bytes {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(format!("of {}", format_bytes(total)))
+                            .color(theme.ui.secondary_text),
+                    );
+                }
+            });
+            usage_bar(ui, context, fraction, color);
+            ui.add_space(2.0);
+            for (label, value) in [
+                ("used", mount.used_bytes),
+                ("available", mount.available_bytes),
+            ] {
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        egui::vec2(80.0, 14.0),
+                        egui::Label::new(
+                            RichText::new(label)
+                                .font(FontId::proportional(11.0))
+                                .color(theme.ui.secondary_text),
+                        ),
+                    );
+                    match (value, mount.total_bytes) {
+                        (Some(v), Some(total)) => {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} of {}",
+                                    format_bytes(v),
+                                    format_bytes(total)
+                                ))
+                                .font(FontId::monospace(11.0))
+                                .color(theme.ui.text),
+                            );
+                        }
+                        _ => {
+                            ui.label(
+                                RichText::new("Unavailable")
+                                    .font(FontId::proportional(11.0))
+                                    .color(theme.status.warning),
+                            );
+                        }
+                    }
+                });
+            }
+        }
+        None => {
+            ui.label(
+                RichText::new("Unavailable")
+                    .font(FontId::proportional(11.0))
+                    .color(theme.status.warning),
+            );
+        }
+    }
+    if let Some(device) = &mount.device {
+        ui.label(
+            RichText::new(format!("Device: {device}"))
+                .font(FontId::proportional(11.0))
+                .color(theme.ui.secondary_text),
+        );
+    }
+    ui.label(
+        RichText::new(format!("Filesystem: {}", mount.filesystem))
+            .font(FontId::proportional(11.0))
+            .color(theme.ui.secondary_text),
+    );
+}
+
+fn compact_storage_row(ui: &mut Ui, context: &SectionContext<'_>, mount: &StorageMount) {
+    let theme = context.theme;
+    let fraction = mount.usage_fraction();
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(&mount.mount_point)
+                .font(FontId::monospace(11.0))
+                .color(theme.ui.text),
+        );
+        match fraction {
+            Some(f) => {
+                let color = storage_usage_color(theme, f);
+                ui.label(
+                    RichText::new(format!("{:.0}%", f * 100.0))
+                        .font(FontId::monospace(11.0))
+                        .color(color),
+                );
+                let used = mount.used_bytes.map(format_bytes).unwrap_or("--".into());
+                let total = mount.total_bytes.map(format_bytes).unwrap_or("--".into());
+                ui.label(
+                    RichText::new(format!("{used} / {total}"))
+                        .font(FontId::monospace(11.0))
+                        .color(theme.ui.secondary_text),
+                );
+            }
+            None => {
+                ui.label(
+                    RichText::new("Unavailable")
+                        .font(FontId::proportional(11.0))
+                        .color(theme.status.warning),
+                );
+            }
+        }
+    });
+}
+
+/// Visual band for storage usage: < 80% normal (accent), 80–89% warning,
+/// >= 90% high (error). These are UI indicators only, not hardware safety
+/// thresholds.
+fn storage_usage_color(theme: &Theme, fraction: f32) -> Color32 {
+    if fraction >= 0.9 {
+        theme.status.error
+    } else if fraction >= 0.8 {
+        theme.status.warning
+    } else {
+        theme.ui.accent
+    }
+}
+
+fn disk_activity_card(
+    ui: &mut Ui,
+    context: &SectionContext<'_>,
+    disk_io: Option<&DiskIoMetrics>,
+    read_history: &[f32],
+    write_history: &[f32],
+) {
+    let theme = context.theme;
+    card(ui, context, "Disk Activity", |ui| {
+        let (read_rate, write_rate) = match disk_io {
+            Some(io) => (io.read_bytes_per_sec, io.write_bytes_per_sec),
+            None => (None, None),
+        };
+        let read_text = match read_rate {
+            Some(r) => format_throughput(r),
+            None => "--".to_owned(),
+        };
+        let write_text = match write_rate {
+            Some(w) => format_throughput(w),
+            None => "--".to_owned(),
+        };
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Read")
+                    .font(FontId::proportional(11.0))
+                    .color(theme.ui.secondary_text),
+            );
+            ui.label(
+                RichText::new(&read_text)
+                    .font(FontId::monospace(11.0))
+                    .color(theme.ui.text),
+            );
+        });
+        let read_color = theme.ui.accent;
+        throughput_graph(ui, context, read_history, read_color);
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Write")
+                    .font(FontId::proportional(11.0))
+                    .color(theme.ui.secondary_text),
+            );
+            ui.label(
+                RichText::new(&write_text)
+                    .font(FontId::monospace(11.0))
+                    .color(theme.ui.text),
+            );
+        });
+        let write_color = theme.status.warning;
+        throughput_graph(ui, context, write_history, write_color);
+    });
+}
+
+/// A small rolling graph that auto-scales to the maximum value in the
+/// history window. Unlike [`graph`] (which assumes a 0–100% range),
+/// this adapts to any throughput scale.
+fn throughput_graph(ui: &mut Ui, context: &SectionContext<'_>, history: &[f32], color: Color32) {
+    let theme = context.theme;
+    let height = 56.0;
+    let width = ui.available_width();
+    if width < 20.0 {
+        return;
+    }
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4.0, with_alpha(theme.ui.text, 0.06));
+
+    let grid_stroke = Stroke::new(1.0_f32, with_alpha(theme.ui.divider, 0.35));
+    for quarter in 1..=3 {
+        let y = rect.top() + rect.height() * quarter as f32 / 4.0;
+        painter.line_segment(
+            [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
+            grid_stroke,
+        );
+    }
+
+    let n = history.len();
+    if n >= 2 {
+        let peak = history
+            .iter()
+            .copied()
+            .fold(0.0_f32, f32::max)
+            .max(THROUGHPUT_FLOOR_BPS);
+        let step = rect.width() / HISTORY_LEN as f32;
+        let points: Vec<Pos2> = history
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let fraction = (value / peak).clamp(0.0, 1.0);
+                let x = rect.right() - (n - 1 - index) as f32 * step;
+                let y = rect.bottom() - fraction * rect.height();
+                Pos2::new(x, y)
+            })
+            .collect();
+        let mut fill_points = points.clone();
+        fill_points.push(Pos2::new(rect.right(), rect.bottom()));
+        fill_points.push(Pos2::new(
+            rect.right() - (n - 1) as f32 * step,
+            rect.bottom(),
+        ));
+        painter.add(Shape::Path(PathShape {
+            points: fill_points,
+            closed: true,
+            fill: with_alpha(color, 0.12),
+            stroke: PathStroke::NONE,
+        }));
+        painter.add(Shape::line(points, Stroke::new(1.5_f32, color)));
+        // Peak label top-left.
+        painter.text(
+            Pos2::new(rect.left() + 4.0, rect.top() + 2.0),
+            Align2::LEFT_TOP,
+            format_throughput(peak),
+            FontId::proportional(9.0),
+            theme.ui.secondary_text,
+        );
+    } else if n == 1 {
+        let peak = history[0].max(THROUGHPUT_FLOOR_BPS);
+        let x = rect.right();
+        let fraction = (history[0] / peak).clamp(0.0, 1.0);
+        let y = rect.bottom() - fraction * rect.height();
+        painter.circle_filled(Pos2::new(x, y), 2.5, color);
+        painter.text(
+            Pos2::new(rect.left() + 4.0, rect.top() + 2.0),
+            Align2::LEFT_TOP,
+            format_throughput(peak),
+            FontId::proportional(9.0),
+            theme.ui.secondary_text,
+        );
+    } else {
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "collecting…",
+            FontId::proportional(10.0),
+            theme.ui.secondary_text,
+        );
+    }
+
+    painter.text(
+        Pos2::new(rect.right() - 4.0, rect.bottom() - 2.0),
+        Align2::RIGHT_BOTTOM,
+        "60s",
+        FontId::proportional(9.0),
+        theme.ui.secondary_text,
+    );
+}
+
+/// Formats bytes per second as a human-readable throughput string.
+pub fn format_throughput(bytes_per_sec: f32) -> String {
+    const KB: f32 = 1024.0;
+    const MB: f32 = KB * 1024.0;
+    const GB: f32 = MB * 1024.0;
+    if bytes_per_sec >= GB {
+        format!("{:.1} GB/s", bytes_per_sec / GB)
+    } else if bytes_per_sec >= MB {
+        format!("{:.1} MB/s", bytes_per_sec / MB)
+    } else if bytes_per_sec >= KB {
+        format!("{:.1} KB/s", bytes_per_sec / KB)
+    } else {
+        format!("{:.0} B/s", bytes_per_sec)
+    }
+}
+
 fn info_card(
     ui: &mut Ui,
     context: &SectionContext<'_>,
@@ -730,5 +1064,42 @@ mod tests {
         assert_eq!(temperature_color(&theme, 84.0), theme.status.warning);
         assert_eq!(temperature_color(&theme, 85.0), theme.status.error);
         assert_eq!(temperature_color(&theme, 95.0), theme.status.error);
+    }
+
+    #[test]
+    fn storage_usage_color_bands() {
+        let theme = get_theme("orbit-dark");
+        assert_eq!(storage_usage_color(&theme, 0.0), theme.ui.accent);
+        assert_eq!(storage_usage_color(&theme, 0.5), theme.ui.accent);
+        assert_eq!(storage_usage_color(&theme, 0.79), theme.ui.accent);
+        assert_eq!(storage_usage_color(&theme, 0.80), theme.status.warning);
+        assert_eq!(storage_usage_color(&theme, 0.85), theme.status.warning);
+        assert_eq!(storage_usage_color(&theme, 0.89), theme.status.warning);
+        assert_eq!(storage_usage_color(&theme, 0.90), theme.status.error);
+        assert_eq!(storage_usage_color(&theme, 1.0), theme.status.error);
+    }
+
+    #[test]
+    fn format_throughput_bytes() {
+        assert_eq!(format_throughput(0.0), "0 B/s");
+        assert_eq!(format_throughput(512.0), "512 B/s");
+        assert_eq!(format_throughput(999.0), "999 B/s");
+    }
+
+    #[test]
+    fn format_throughput_kilobytes() {
+        assert_eq!(format_throughput(1024.0), "1.0 KB/s");
+        assert_eq!(format_throughput(1536.0), "1.5 KB/s");
+    }
+
+    #[test]
+    fn format_throughput_megabytes() {
+        assert_eq!(format_throughput(1_048_576.0), "1.0 MB/s");
+        assert_eq!(format_throughput(12_582_912.0), "12.0 MB/s");
+    }
+
+    #[test]
+    fn format_throughput_gigabytes() {
+        assert_eq!(format_throughput(1_073_741_824.0), "1.0 GB/s");
     }
 }

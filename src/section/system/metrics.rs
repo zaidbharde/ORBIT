@@ -36,6 +36,10 @@ pub struct SystemMetrics {
     /// Used memory as a percent of total (0.0 - 100.0).
     pub memory_usage: Option<f32>,
     pub uptime_secs: Option<u64>,
+    /// Discovered storage mounts (updated every ~1 Hz).
+    pub storage_mounts: Vec<super::storage::StorageMount>,
+    /// Latest disk I/O throughput, or `None` when unavailable.
+    pub disk_io: Option<super::storage::DiskIoMetrics>,
 }
 
 /// Number of CPU time fields per `/proc/stat` cpu line.
