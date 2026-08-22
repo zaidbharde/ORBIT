@@ -604,6 +604,7 @@ pub fn show_process_card(ui: &mut Ui, context: &SectionContext<'_>, monitor: &mu
         let visible_rows = total_rows.min(max_visible_rows);
 
         egui::ScrollArea::vertical()
+            .id_salt("process-list")
             .max_height(row_height * visible_rows as f32 + 8.0)
             .auto_shrink([false, false])
             .show(ui, |ui| {

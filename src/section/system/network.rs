@@ -589,6 +589,7 @@ pub fn show_network_card(ui: &mut Ui, context: &SectionContext<'_>, monitor: &mu
         let interfaces_snapshot: Vec<_> = monitor.interfaces.iter().cloned().collect();
 
         egui::ScrollArea::vertical()
+            .id_salt("network-interfaces")
             .max_height(row_height * visible_rows as f32 + 4.0)
             .auto_shrink([false, false])
             .show(ui, |ui| {

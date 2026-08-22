@@ -162,6 +162,7 @@ impl Section for SystemSection {
         let read_history = self.read_history.make_contiguous();
         let write_history = self.write_history.make_contiguous();
         egui::ScrollArea::vertical()
+            .id_salt("system-dashboard")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 dashboard::show(

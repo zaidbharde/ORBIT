@@ -506,6 +506,7 @@ impl OrbitApp {
 
                 ui.separator();
                 egui::ScrollArea::vertical()
+                    .id_salt("command-palette")
                     .max_height(320.0)
                     .show(ui, |ui| {
                         for (rank, &item_index) in filtered.iter().enumerate() {
