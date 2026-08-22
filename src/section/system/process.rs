@@ -932,303 +932,347 @@ pub fn show_process_card(ui: &mut Ui, context: &SectionContext<'_>, monitor: &mu
         let total_rows = sorted_pids.len();
         let visible_rows = total_rows.min(max_visible_rows);
 
-        egui::ScrollArea::vertical()
-            .id_salt("process-list")
-            .max_height(row_height * visible_rows as f32 + 8.0)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for &pid in &sorted_pids {
-                    let proc_info = match monitor.find_by_pid(pid) {
-                        Some(p) => p.clone(),
-                        None => continue,
-                    };
-                    let is_selected = monitor.selected_pid == Some(proc_info.pid);
-                    let response = ui
-                        .horizontal(|ui| {
-                            if is_selected {
-                                let (rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(ui.available_width(), row_height),
-                                    egui::Sense::hover(),
+        if sorted_pids.is_empty() && !monitor.search.is_empty() {
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("No processes match search")
+                    .font(FontId::proportional(10.0))
+                    .color(theme.ui.secondary_text),
+            );
+        } else {
+            egui::ScrollArea::vertical()
+                .id_salt("process-list")
+                .max_height(row_height * visible_rows as f32 + 8.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for &pid in &sorted_pids {
+                        let proc_info = match monitor.find_by_pid(pid) {
+                            Some(p) => p.clone(),
+                            None => continue,
+                        };
+                        let is_selected = monitor.selected_pid == Some(proc_info.pid);
+                        let response = ui
+                            .horizontal(|ui| {
+                                if is_selected {
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(ui.available_width(), row_height),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter_at(rect).rect_filled(
+                                        rect,
+                                        2.0,
+                                        with_alpha(theme.ui.accent, 0.12),
+                                    );
+                                }
+                                ui.add_sized(
+                                    egui::vec2(52.0, row_height),
+                                    egui::Label::new(
+                                        RichText::new(format!("{}", proc_info.pid))
+                                            .font(FontId::monospace(10.0))
+                                            .color(theme.ui.text),
+                                    ),
                                 );
-                                ui.painter_at(rect).rect_filled(
-                                    rect,
-                                    2.0,
-                                    with_alpha(theme.ui.accent, 0.12),
+                                ui.add_sized(
+                                    egui::vec2(120.0, row_height),
+                                    egui::Label::new(
+                                        RichText::new(truncate(&proc_info.name, 16))
+                                            .font(FontId::monospace(10.0))
+                                            .color(theme.ui.text),
+                                    ),
                                 );
-                            }
-                            ui.add_sized(
-                                egui::vec2(52.0, row_height),
-                                egui::Label::new(
-                                    RichText::new(format!("{}", proc_info.pid))
+                                let cpu_text = proc_info
+                                    .cpu_usage
+                                    .map(|u| format!("{u:>5.1}%"))
+                                    .unwrap_or_else(|| "  -- ".into());
+                                ui.add_sized(
+                                    egui::vec2(50.0, row_height),
+                                    egui::Label::new(
+                                        RichText::new(cpu_text)
+                                            .font(FontId::monospace(10.0))
+                                            .color(cpu_color(theme, proc_info.cpu_usage)),
+                                    ),
+                                );
+                                let mem_text = proc_info
+                                    .memory_bytes
+                                    .map(|b| {
+                                        let s = crate::section::system::dashboard::format_bytes(b);
+                                        truncate_owned(s, 8)
+                                    })
+                                    .unwrap_or_else(|| "--".into());
+                                ui.add_sized(
+                                    egui::vec2(70.0, row_height),
+                                    egui::Label::new(
+                                        RichText::new(mem_text)
+                                            .font(FontId::monospace(10.0))
+                                            .color(theme.ui.text),
+                                    ),
+                                );
+                                ui.label(
+                                    RichText::new(proc_info.state.label())
                                         .font(FontId::monospace(10.0))
-                                        .color(theme.ui.text),
-                                ),
-                            );
-                            ui.add_sized(
-                                egui::vec2(120.0, row_height),
-                                egui::Label::new(
-                                    RichText::new(truncate(&proc_info.name, 16))
-                                        .font(FontId::monospace(10.0))
-                                        .color(theme.ui.text),
-                                ),
-                            );
-                            let cpu_text = proc_info
-                                .cpu_usage
-                                .map(|u| format!("{u:>5.1}%"))
-                                .unwrap_or_else(|| "  -- ".into());
-                            ui.add_sized(
-                                egui::vec2(50.0, row_height),
-                                egui::Label::new(
-                                    RichText::new(cpu_text)
-                                        .font(FontId::monospace(10.0))
-                                        .color(cpu_color(theme, proc_info.cpu_usage)),
-                                ),
-                            );
-                            let mem_text = proc_info
-                                .memory_bytes
-                                .map(|b| {
-                                    let s = crate::section::system::dashboard::format_bytes(b);
-                                    truncate_owned(s, 8)
-                                })
-                                .unwrap_or_else(|| "--".into());
-                            ui.add_sized(
-                                egui::vec2(70.0, row_height),
-                                egui::Label::new(
-                                    RichText::new(mem_text)
-                                        .font(FontId::monospace(10.0))
-                                        .color(theme.ui.text),
-                                ),
-                            );
-                            ui.label(
-                                RichText::new(proc_info.state.label())
-                                    .font(FontId::monospace(10.0))
-                                    .color(state_color(theme, proc_info.state)),
-                            );
-                        })
-                        .response;
+                                        .color(state_color(theme, proc_info.state)),
+                                );
+                            })
+                            .response;
 
-                    if response.interact(egui::Sense::click()).clicked() {
-                        if monitor.selected_pid == Some(proc_info.pid) {
-                            monitor.selected_pid = None;
-                        } else {
-                            monitor.selected_pid = Some(proc_info.pid);
+                        if response.interact(egui::Sense::click()).clicked() {
+                            if monitor.selected_pid == Some(proc_info.pid) {
+                                monitor.selected_pid = None;
+                            } else {
+                                monitor.selected_pid = Some(proc_info.pid);
+                            }
                         }
                     }
-                }
-            });
+                });
+        }
 
         // Detail panel for selected process.
         if let Some(sel_pid) = monitor.selected_pid {
-            if let Some(proc_info) = monitor.find_by_pid(sel_pid).cloned() {
-                ui.add_space(6.0);
-                ui.separator();
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new("Process Details")
-                        .font(FontId::proportional(11.0))
-                        .color(theme.ui.secondary_text)
-                        .strong(),
-                );
-                detail_row(ui, theme, "PID", Some(format!("{}", proc_info.pid)));
-                detail_row(ui, theme, "Name", Some(proc_info.name.clone()));
-                detail_row(ui, theme, "State", Some(proc_info.state.label().to_owned()));
-                detail_row(
-                    ui,
-                    theme,
-                    "User",
-                    proc_info
-                        .username
-                        .clone()
-                        .or_else(|| proc_info.uid.map(|u| format!("UID {u}"))),
-                );
-                detail_row(
-                    ui,
-                    theme,
-                    "CPU",
-                    proc_info.cpu_usage.map(|u| format!("{u:.1}%")),
-                );
-                detail_row(
-                    ui,
-                    theme,
-                    "Memory",
-                    proc_info
-                        .memory_bytes
-                        .map(crate::section::system::dashboard::format_bytes),
-                );
-                detail_row(ui, theme, "Executable", proc_info.executable.clone());
-                detail_row(ui, theme, "Command", proc_info.command.clone());
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(4.0);
 
-                // P6.1: Action buttons
-                ui.add_space(6.0);
-                ui.separator();
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new("Actions")
-                        .font(FontId::proportional(11.0))
-                        .color(theme.ui.secondary_text)
-                        .strong(),
-                );
-
-                let is_orbit = is_orbit_self(proc_info.pid);
-                let is_protected = is_protected_pid(proc_info.pid);
-                let is_alive = is_process_alive(proc_info.pid);
-                let my_uid = current_uid();
-                let is_owned = proc_info.uid.is_some_and(|u| u == my_uid);
-                let can_control = !is_orbit && !is_protected && is_alive && is_owned;
-
-                if is_orbit {
+            match monitor.find_by_pid(sel_pid).cloned() {
+                Some(proc_info) => {
                     ui.label(
-                        RichText::new("ORBIT process \u{2014} control disabled")
-                            .font(FontId::proportional(10.0))
-                            .color(theme.status.warning),
+                        RichText::new("Process Details")
+                            .font(FontId::proportional(11.0))
+                            .color(theme.ui.secondary_text)
+                            .strong(),
                     );
-                } else if is_protected {
-                    ui.label(
-                        RichText::new("Protected system process \u{2014} control disabled")
-                            .font(FontId::proportional(10.0))
-                            .color(theme.status.warning),
+                    detail_row(ui, theme, "PID", Some(format!("{}", proc_info.pid)));
+                    detail_row(ui, theme, "Name", Some(proc_info.name.clone()));
+                    detail_row(ui, theme, "State", Some(proc_info.state.label().to_owned()));
+                    detail_row(
+                        ui,
+                        theme,
+                        "User",
+                        proc_info
+                            .username
+                            .clone()
+                            .or_else(|| proc_info.uid.map(|u| format!("UID {u}"))),
                     );
-                }
+                    detail_row(
+                        ui,
+                        theme,
+                        "CPU",
+                        proc_info.cpu_usage.map(|u| format!("{u:.1}%")),
+                    );
+                    detail_row(
+                        ui,
+                        theme,
+                        "Memory",
+                        proc_info
+                            .memory_bytes
+                            .map(crate::section::system::dashboard::format_bytes),
+                    );
+                    detail_row(ui, theme, "Executable", proc_info.executable.clone());
+                    detail_row(ui, theme, "Command", proc_info.command.clone());
 
-                ui.horizontal(|ui| {
-                    // Refresh button (always available for listed processes)
-                    let refresh_btn = egui::Button::new(
-                        RichText::new("Refresh")
-                            .font(FontId::proportional(10.0))
-                            .color(theme.ui.text),
-                    )
-                    .fill(theme.ui.accent);
-                    if ui.add(refresh_btn).clicked() {
-                        monitor.pending_action =
-                            Some(ProcessAction::Refresh { pid: proc_info.pid });
-                    }
-
-                    // Stop button (SIGTERM with confirmation)
-                    let stop_btn = egui::Button::new(
-                        RichText::new("Stop")
-                            .font(FontId::proportional(10.0))
-                            .color(if can_control {
-                                theme.status.warning
-                            } else {
-                                theme.ui.secondary_text
-                            }),
-                    )
-                    .fill(if can_control {
-                        with_alpha(theme.status.warning, 0.15)
-                    } else {
-                        Color32::TRANSPARENT
-                    });
-                    if ui.add(stop_btn).clicked() && can_control {
-                        monitor.open_confirm(ConfirmKind::Stop {
-                            pid: proc_info.pid,
-                            name: proc_info.name.clone(),
-                        });
-                    }
-
-                    // Kill button (SIGKILL with stronger confirmation)
-                    let kill_btn = egui::Button::new(
-                        RichText::new("Kill")
-                            .font(FontId::proportional(10.0))
-                            .color(if can_control {
-                                theme.status.error
-                            } else {
-                                theme.ui.secondary_text
-                            }),
-                    )
-                    .fill(if can_control {
-                        with_alpha(theme.status.error, 0.15)
-                    } else {
-                        Color32::TRANSPARENT
-                    });
-                    if ui.add(kill_btn).clicked() && can_control {
-                        monitor.open_confirm(ConfirmKind::Kill {
-                            pid: proc_info.pid,
-                            name: proc_info.name.clone(),
-                        });
-                    }
-                });
-
-                // P6.1: Action result banner
-                if let Some(ref result) = monitor.last_action_result {
+                    // P6.1: Action buttons
+                    ui.add_space(6.0);
+                    ui.separator();
                     ui.add_space(4.0);
-                    let (bg_color, text_color) = match result {
-                        ActionResult::Success(_) => {
-                            (with_alpha(theme.status.success, 0.15), theme.status.success)
-                        }
-                        ActionResult::Denied(_) => {
-                            (with_alpha(theme.status.warning, 0.15), theme.status.warning)
-                        }
-                        ActionResult::Error(_) => {
-                            (with_alpha(theme.status.error, 0.15), theme.status.error)
-                        }
-                    };
-                    let banner = Frame::new()
-                        .fill(bg_color)
-                        .corner_radius(4.0)
-                        .inner_margin(Margin::symmetric(8, 4));
-                    banner.show(ui, |ui| {
+                    ui.label(
+                        RichText::new("Actions")
+                            .font(FontId::proportional(11.0))
+                            .color(theme.ui.secondary_text)
+                            .strong(),
+                    );
+
+                    let is_orbit = is_orbit_self(proc_info.pid);
+                    let is_protected = is_protected_pid(proc_info.pid);
+                    let is_alive = is_process_alive(proc_info.pid);
+                    let my_uid = current_uid();
+                    let is_owned = proc_info.uid.is_some_and(|u| u == my_uid);
+                    let can_control = !is_orbit && !is_protected && is_alive && is_owned;
+
+                    if is_orbit {
                         ui.label(
-                            RichText::new(result.message())
+                            RichText::new("ORBIT process \u{2014} control disabled")
                                 .font(FontId::proportional(10.0))
-                                .color(text_color),
+                                .color(theme.status.warning),
                         );
+                    } else if is_protected {
+                        ui.label(
+                            RichText::new("Protected system process \u{2014} control disabled")
+                                .font(FontId::proportional(10.0))
+                                .color(theme.status.warning),
+                        );
+                    } else if !is_alive {
+                        ui.label(
+                            RichText::new("Process no longer running")
+                                .font(FontId::proportional(10.0))
+                                .color(theme.status.warning),
+                        );
+                    }
+
+                    ui.horizontal(|ui| {
+                        // Refresh button
+                        let refresh_btn = egui::Button::new(
+                            RichText::new("Refresh")
+                                .font(FontId::proportional(10.0))
+                                .color(theme.ui.text),
+                        )
+                        .fill(theme.ui.accent);
+                        if ui.add(refresh_btn).clicked() {
+                            monitor.pending_action =
+                                Some(ProcessAction::Refresh { pid: proc_info.pid });
+                        }
+
+                        // Stop button (SIGTERM with confirmation)
+                        let stop_btn = egui::Button::new(
+                            RichText::new("Stop")
+                                .font(FontId::proportional(10.0))
+                                .color(if can_control {
+                                    theme.status.warning
+                                } else {
+                                    theme.ui.secondary_text
+                                }),
+                        )
+                        .fill(if can_control {
+                            with_alpha(theme.status.warning, 0.15)
+                        } else {
+                            Color32::TRANSPARENT
+                        });
+                        if ui.add(stop_btn).clicked() && can_control {
+                            monitor.open_confirm(ConfirmKind::Stop {
+                                pid: proc_info.pid,
+                                name: proc_info.name.clone(),
+                            });
+                        }
+
+                        // Kill button (SIGKILL with stronger confirmation)
+                        let kill_btn = egui::Button::new(
+                            RichText::new("Kill")
+                                .font(FontId::proportional(10.0))
+                                .color(if can_control {
+                                    theme.status.error
+                                } else {
+                                    theme.ui.secondary_text
+                                }),
+                        )
+                        .fill(if can_control {
+                            with_alpha(theme.status.error, 0.15)
+                        } else {
+                            Color32::TRANSPARENT
+                        });
+                        if ui.add(kill_btn).clicked() && can_control {
+                            monitor.open_confirm(ConfirmKind::Kill {
+                                pid: proc_info.pid,
+                                name: proc_info.name.clone(),
+                            });
+                        }
+                    });
+
+                    // P6.1: Action result banner
+                    if let Some(ref result) = monitor.last_action_result {
+                        ui.add_space(4.0);
+                        let (bg_color, text_color) = match result {
+                            ActionResult::Success(_) => {
+                                (with_alpha(theme.status.success, 0.15), theme.status.success)
+                            }
+                            ActionResult::Denied(_) => {
+                                (with_alpha(theme.status.warning, 0.15), theme.status.warning)
+                            }
+                            ActionResult::Error(_) => {
+                                (with_alpha(theme.status.error, 0.15), theme.status.error)
+                            }
+                        };
+                        let banner = Frame::new()
+                            .fill(bg_color)
+                            .corner_radius(4.0)
+                            .inner_margin(Margin::symmetric(8, 4));
+                        banner.show(ui, |ui| {
+                            ui.label(
+                                RichText::new(result.message())
+                                    .font(FontId::proportional(10.0))
+                                    .color(text_color),
+                            );
+                        });
+                    }
+
+                    // P6.2: Command Builder section
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("Command")
+                            .font(FontId::proportional(11.0))
+                            .color(theme.ui.secondary_text)
+                            .strong(),
+                    );
+                    monitor
+                        .command_builder
+                        .sync_with_process(proc_info.pid, proc_info.command.as_deref());
+
+                    let _cmd_response = ui.add(
+                        egui::TextEdit::singleline(&mut monitor.command_builder.command_text)
+                            .font(FontId::monospace(10.0))
+                            .desired_width(ui.available_width())
+                            .code_editor(),
+                    );
+
+                    ui.horizontal(|ui| {
+                        // Copy button
+                        let copy_btn = egui::Button::new(
+                            RichText::new("Copy")
+                                .font(FontId::proportional(10.0))
+                                .color(theme.ui.text),
+                        )
+                        .fill(theme.ui.accent);
+                        if ui.add(copy_btn).clicked() {
+                            ui.ctx()
+                                .copy_text(monitor.command_builder.command_text.clone());
+                        }
+
+                        // Reset button (only enabled when modified)
+                        let is_modified = monitor.command_builder.is_modified();
+                        let reset_btn = egui::Button::new(
+                            RichText::new("Reset")
+                                .font(FontId::proportional(10.0))
+                                .color(if is_modified {
+                                    theme.ui.text
+                                } else {
+                                    theme.ui.secondary_text
+                                }),
+                        )
+                        .fill(if is_modified {
+                            theme.ui.tab_inactive
+                        } else {
+                            Color32::TRANSPARENT
+                        });
+                        if ui.add(reset_btn).clicked() && is_modified {
+                            monitor.command_builder.reset();
+                        }
                     });
                 }
-
-                // P6.2: Command Builder section
-                ui.add_space(6.0);
-                ui.separator();
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new("Command")
-                        .font(FontId::proportional(11.0))
-                        .color(theme.ui.secondary_text)
-                        .strong(),
-                );
-                monitor
-                    .command_builder
-                    .sync_with_process(proc_info.pid, proc_info.command.as_deref());
-
-                let _cmd_response = ui.add(
-                    egui::TextEdit::singleline(&mut monitor.command_builder.command_text)
-                        .font(FontId::monospace(10.0))
-                        .desired_width(ui.available_width())
-                        .code_editor(),
-                );
-
-                ui.horizontal(|ui| {
-                    // Copy button
-                    let copy_btn = egui::Button::new(
-                        RichText::new("Copy")
+                None => {
+                    // Selected process disappeared from the process list.
+                    ui.label(
+                        RichText::new("Process Details")
+                            .font(FontId::proportional(11.0))
+                            .color(theme.ui.secondary_text)
+                            .strong(),
+                    );
+                    ui.add_space(4.0);
+                    detail_row(ui, theme, "PID", Some(format!("{sel_pid}")));
+                    ui.label(
+                        RichText::new("Process no longer running")
                             .font(FontId::proportional(10.0))
-                            .color(theme.ui.text),
-                    )
-                    .fill(theme.ui.accent);
-                    if ui.add(copy_btn).clicked() {
-                        ui.ctx()
-                            .copy_text(monitor.command_builder.command_text.clone());
-                    }
-
-                    // Reset button (only enabled when modified)
-                    let is_modified = monitor.command_builder.is_modified();
-                    let reset_btn = egui::Button::new(
-                        RichText::new("Reset")
+                            .color(theme.status.warning),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("Actions unavailable")
                             .font(FontId::proportional(10.0))
-                            .color(if is_modified {
-                                theme.ui.text
-                            } else {
-                                theme.ui.secondary_text
-                            }),
-                    )
-                    .fill(if is_modified {
-                        theme.ui.tab_inactive
-                    } else {
-                        Color32::TRANSPARENT
-                    });
-                    if ui.add(reset_btn).clicked() && is_modified {
-                        monitor.command_builder.reset();
-                    }
-                });
+                            .color(theme.ui.secondary_text),
+                    );
+                    // Clear command builder for disappeared process
+                    monitor.command_builder.tracked_pid = None;
+                    monitor.command_builder.command_text.clear();
+                    monitor.command_builder.original_command.clear();
+                }
             }
         }
     });
@@ -1956,5 +2000,185 @@ mod tests {
         let mut b = CommandBuilderState::new();
         b.sync_with_process(1, Some("cmd"));
         assert_eq!(a, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // P6.4: Disappeared process & empty search tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn find_by_pid_returns_none_for_missing_pid() {
+        let monitor = ProcessMonitor::new();
+        assert!(monitor.find_by_pid(99999).is_none());
+    }
+
+    #[test]
+    fn sorted_filtered_returns_empty_for_nonmatching_search() {
+        let mut monitor = ProcessMonitor::new();
+        monitor.processes.push(ProcessInfo {
+            pid: 1,
+            name: "bash".into(),
+            cpu_usage: None,
+            memory_bytes: None,
+            memory_percent: None,
+            state: ProcessState::Sleeping,
+            uid: None,
+            username: None,
+            command: None,
+            executable: None,
+            cpu_ticks: 0,
+            start_ticks: 0,
+        });
+        monitor.search = "zzz_nonexistent".into();
+        assert!(monitor.sorted_filtered().is_empty());
+    }
+
+    #[test]
+    fn sorted_filtered_matches_name() {
+        let mut monitor = ProcessMonitor::new();
+        monitor.processes.push(ProcessInfo {
+            pid: 1,
+            name: "bash".into(),
+            cpu_usage: None,
+            memory_bytes: None,
+            memory_percent: None,
+            state: ProcessState::Sleeping,
+            uid: None,
+            username: None,
+            command: None,
+            executable: None,
+            cpu_ticks: 0,
+            start_ticks: 0,
+        });
+        monitor.processes.push(ProcessInfo {
+            pid: 2,
+            name: "vim".into(),
+            cpu_usage: None,
+            memory_bytes: None,
+            memory_percent: None,
+            state: ProcessState::Running,
+            uid: None,
+            username: None,
+            command: None,
+            executable: None,
+            cpu_ticks: 0,
+            start_ticks: 0,
+        });
+        monitor.search = "bash".into();
+        let filtered = monitor.sorted_filtered();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].pid, 1);
+    }
+
+    #[test]
+    fn sorted_filtered_matches_command() {
+        let mut monitor = ProcessMonitor::new();
+        monitor.processes.push(ProcessInfo {
+            pid: 1,
+            name: "python3".into(),
+            cpu_usage: None,
+            memory_bytes: None,
+            memory_percent: None,
+            state: ProcessState::Sleeping,
+            uid: None,
+            username: None,
+            command: Some("python3 -m http.server".into()),
+            executable: None,
+            cpu_ticks: 0,
+            start_ticks: 0,
+        });
+        monitor.search = "http.server".into();
+        let filtered = monitor.sorted_filtered();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].pid, 1);
+    }
+
+    #[test]
+    fn sorted_filtered_matches_executable() {
+        let mut monitor = ProcessMonitor::new();
+        monitor.processes.push(ProcessInfo {
+            pid: 1,
+            name: "node".into(),
+            cpu_usage: None,
+            memory_bytes: None,
+            memory_percent: None,
+            state: ProcessState::Sleeping,
+            uid: None,
+            username: None,
+            command: None,
+            executable: Some("/usr/bin/node".into()),
+            cpu_ticks: 0,
+            start_ticks: 0,
+        });
+        monitor.search = "node".into();
+        let filtered = monitor.sorted_filtered();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].pid, 1);
+    }
+
+    #[test]
+    fn command_builder_clear_on_disappear() {
+        let mut cb = CommandBuilderState::new();
+        cb.sync_with_process(42, Some("/bin/bash"));
+        assert_eq!(cb.tracked_pid, Some(42));
+        // Simulate disappear: clear state
+        cb.tracked_pid = None;
+        cb.command_text.clear();
+        cb.original_command.clear();
+        assert!(cb.tracked_pid.is_none());
+        assert!(cb.command_text.is_empty());
+        assert!(cb.original_command.is_empty());
+    }
+
+    #[test]
+    fn counts_update_correctly() {
+        let mut monitor = ProcessMonitor::new();
+        monitor.processes.push(ProcessInfo {
+            pid: 1,
+            name: "running".into(),
+            cpu_usage: None,
+            memory_bytes: None,
+            memory_percent: None,
+            state: ProcessState::Running,
+            uid: None,
+            username: None,
+            command: None,
+            executable: None,
+            cpu_ticks: 0,
+            start_ticks: 0,
+        });
+        monitor.processes.push(ProcessInfo {
+            pid: 2,
+            name: "sleeping".into(),
+            cpu_usage: None,
+            memory_bytes: None,
+            memory_percent: None,
+            state: ProcessState::Sleeping,
+            uid: None,
+            username: None,
+            command: None,
+            executable: None,
+            cpu_ticks: 0,
+            start_ticks: 0,
+        });
+        monitor.processes.push(ProcessInfo {
+            pid: 3,
+            name: "zombie".into(),
+            cpu_usage: None,
+            memory_bytes: None,
+            memory_percent: None,
+            state: ProcessState::Zombie,
+            uid: None,
+            username: None,
+            command: None,
+            executable: None,
+            cpu_ticks: 0,
+            start_ticks: 0,
+        });
+        monitor.update_counts(&monitor.processes.clone());
+        assert_eq!(monitor.total_count, 3);
+        assert_eq!(monitor.running_count, 1);
+        assert_eq!(monitor.sleeping_count, 1);
+        assert_eq!(monitor.zombie_count, 1);
     }
 }
