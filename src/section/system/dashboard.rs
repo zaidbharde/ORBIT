@@ -7,6 +7,7 @@
 
 use super::HISTORY_LEN;
 use super::gpu::{GpuBackend, GpuInfo, GpuMonitor};
+use super::hwmon::{CurrentSensor, HwmonDevice, HwmonMonitor, TempSensor, VoltageSensor};
 use super::metrics::{SystemInfo, SystemMetrics};
 use super::storage::{DiskIoMetrics, StorageMount, THROUGHPUT_FLOOR_BPS};
 use super::thermal::{ThermalMonitor, ThermalZone};
@@ -33,6 +34,8 @@ pub fn show(
     write_history: &[f32],
     thermal: &ThermalMonitor,
     thermal_history: &[f32],
+    hwmon: &HwmonMonitor,
+    fan_history: &[f32],
     process_monitor: &mut super::process::ProcessMonitor,
     network_monitor: &mut super::network::NetworkMonitor,
 ) {
@@ -55,6 +58,7 @@ pub fn show(
             write_history,
         );
     });
+    hardware_sensors_card(ui, context, hwmon, fan_history);
     info_card(ui, context, info, metrics);
     super::network::show_network_card(ui, context, network_monitor);
     super::process::show_process_card(ui, context, process_monitor);
@@ -489,6 +493,341 @@ fn thermal_zone_row(ui: &mut Ui, context: &SectionContext<'_>, zone: &ThermalZon
 
 fn stat_line(ui: &mut Ui, context: &SectionContext<'_>, label: &str, value: Option<String>) {
     stat_line_colored(ui, context, label, value, context.theme.ui.text);
+}
+
+fn hardware_sensors_card(
+    ui: &mut Ui,
+    context: &SectionContext<'_>,
+    monitor: &HwmonMonitor,
+    fan_history: &[f32],
+) {
+    let theme = context.theme;
+    card(ui, context, "Hardware Sensors", |ui| {
+        let fans = monitor.all_fans();
+        let temps = monitor.all_temps();
+        let voltages = monitor.all_voltages();
+        let currents = monitor.all_currents();
+
+        let has_any =
+            !fans.is_empty() || !temps.is_empty() || !voltages.is_empty() || !currents.is_empty();
+        if !has_any {
+            ui.label(RichText::new("Telemetry unavailable").color(theme.ui.secondary_text));
+            return;
+        }
+
+        if !fans.is_empty() {
+            ui.label(
+                RichText::new("Fans")
+                    .font(FontId::proportional(11.0))
+                    .color(theme.ui.secondary_text)
+                    .strong(),
+            );
+            for (device, fan) in &fans {
+                fan_row(ui, context, device, fan);
+            }
+            if monitor.primary_fan_rpm().is_some() {
+                fan_rpm_graph(ui, context, fan_history);
+            }
+        }
+
+        if !temps.is_empty() {
+            ui.add_space(4.0);
+            ui.separator();
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Temperatures")
+                    .font(FontId::proportional(11.0))
+                    .color(theme.ui.secondary_text)
+                    .strong(),
+            );
+            for (device, temp) in &temps {
+                hwmon_temp_row(ui, context, device, temp);
+            }
+        }
+
+        if !voltages.is_empty() {
+            ui.add_space(4.0);
+            ui.separator();
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Voltages")
+                    .font(FontId::proportional(11.0))
+                    .color(theme.ui.secondary_text)
+                    .strong(),
+            );
+            for (device, voltage) in &voltages {
+                voltage_row(ui, context, device, voltage);
+            }
+        }
+
+        if !currents.is_empty() {
+            ui.add_space(4.0);
+            ui.separator();
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Currents")
+                    .font(FontId::proportional(11.0))
+                    .color(theme.ui.secondary_text)
+                    .strong(),
+            );
+            for (device, current) in &currents {
+                current_row(ui, context, device, current);
+            }
+        }
+    });
+}
+
+fn fan_row(
+    ui: &mut Ui,
+    context: &SectionContext<'_>,
+    device: &HwmonDevice,
+    fan: &super::hwmon::FanSensor,
+) {
+    let theme = context.theme;
+    let fallback = format!("fan{}", fan.index);
+    ui.horizontal(|ui| {
+        let label = fan.label.as_deref().unwrap_or(&fallback);
+        ui.add_sized(
+            egui::vec2(120.0, 16.0),
+            egui::Label::new(
+                RichText::new(label)
+                    .font(FontId::proportional(11.0))
+                    .color(theme.ui.secondary_text),
+            ),
+        );
+        match fan.rpm {
+            Some(0) => {
+                ui.label(
+                    RichText::new("0 RPM (stopped)")
+                        .font(FontId::monospace(11.0))
+                        .color(theme.ui.secondary_text),
+                );
+            }
+            Some(rpm) => {
+                ui.label(
+                    RichText::new(format!("{rpm} RPM"))
+                        .font(FontId::monospace(11.0))
+                        .color(theme.ui.text),
+                );
+            }
+            None => {
+                ui.label(
+                    RichText::new("Unavailable")
+                        .font(FontId::proportional(11.0))
+                        .color(theme.status.warning),
+                );
+            }
+        }
+        ui.label(
+            RichText::new(format!("({})", device.name))
+                .font(FontId::proportional(9.0))
+                .color(theme.ui.secondary_text),
+        );
+    });
+}
+
+fn fan_rpm_graph(ui: &mut Ui, context: &SectionContext<'_>, fan_history: &[f32]) {
+    let theme = context.theme;
+    let height = 56.0;
+    let width = ui.available_width();
+    if width < 20.0 || fan_history.is_empty() {
+        return;
+    }
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4.0, with_alpha(theme.ui.text, 0.06));
+
+    let grid_stroke = Stroke::new(1.0_f32, with_alpha(theme.ui.divider, 0.35));
+    for quarter in 1..=3 {
+        let y = rect.top() + rect.height() * quarter as f32 / 4.0;
+        painter.line_segment(
+            [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
+            grid_stroke,
+        );
+    }
+
+    let n = fan_history.len();
+    let peak = fan_history.iter().copied().fold(0.0_f32, f32::max).max(1.0);
+
+    let step = rect.width() / HISTORY_LEN as f32;
+    if n >= 2 {
+        let points: Vec<Pos2> = fan_history
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let fraction = (value / peak).clamp(0.0, 1.0);
+                let x = rect.right() - (n - 1 - index) as f32 * step;
+                let y = rect.bottom() - fraction * rect.height();
+                Pos2::new(x, y)
+            })
+            .collect();
+        let mut fill_points = points.clone();
+        fill_points.push(Pos2::new(rect.right(), rect.bottom()));
+        fill_points.push(Pos2::new(
+            rect.right() - (n - 1) as f32 * step,
+            rect.bottom(),
+        ));
+        painter.add(Shape::Path(PathShape {
+            points: fill_points,
+            closed: true,
+            fill: with_alpha(theme.ui.accent, 0.12),
+            stroke: PathStroke::NONE,
+        }));
+        painter.add(Shape::line(points, Stroke::new(1.5_f32, theme.ui.accent)));
+        painter.text(
+            Pos2::new(rect.left() + 4.0, rect.top() + 2.0),
+            Align2::LEFT_TOP,
+            format!("{peak:.0} RPM"),
+            FontId::proportional(9.0),
+            theme.ui.secondary_text,
+        );
+    } else if n == 1 {
+        let fraction = (fan_history[0] / peak).clamp(0.0, 1.0);
+        let y = rect.bottom() - fraction * rect.height();
+        painter.circle_filled(Pos2::new(rect.right(), y), 2.5, theme.ui.accent);
+        painter.text(
+            Pos2::new(rect.left() + 4.0, rect.top() + 2.0),
+            Align2::LEFT_TOP,
+            format!("{peak:.0} RPM"),
+            FontId::proportional(9.0),
+            theme.ui.secondary_text,
+        );
+    }
+
+    painter.text(
+        Pos2::new(rect.right() - 4.0, rect.bottom() - 2.0),
+        Align2::RIGHT_BOTTOM,
+        "60s",
+        FontId::proportional(9.0),
+        theme.ui.secondary_text,
+    );
+}
+
+fn hwmon_temp_row(
+    ui: &mut Ui,
+    context: &SectionContext<'_>,
+    device: &HwmonDevice,
+    temp: &TempSensor,
+) {
+    let theme = context.theme;
+    let fallback = format!("temp{}", temp.index);
+    ui.horizontal(|ui| {
+        let label = temp.label.as_deref().unwrap_or(&fallback);
+        ui.add_sized(
+            egui::vec2(120.0, 16.0),
+            egui::Label::new(
+                RichText::new(label)
+                    .font(FontId::proportional(11.0))
+                    .color(theme.ui.secondary_text),
+            ),
+        );
+        match temp.temp_celsius() {
+            Some(celsius) => {
+                let color = temperature_color(theme, celsius);
+                ui.label(
+                    RichText::new(format!("{celsius:.0}°C"))
+                        .font(FontId::monospace(11.0))
+                        .color(color),
+                );
+            }
+            None => {
+                ui.label(
+                    RichText::new("Unavailable")
+                        .font(FontId::proportional(11.0))
+                        .color(theme.status.warning),
+                );
+            }
+        }
+        ui.label(
+            RichText::new(format!("({})", device.name))
+                .font(FontId::proportional(9.0))
+                .color(theme.ui.secondary_text),
+        );
+    });
+}
+
+fn voltage_row(
+    ui: &mut Ui,
+    context: &SectionContext<'_>,
+    device: &HwmonDevice,
+    voltage: &VoltageSensor,
+) {
+    let theme = context.theme;
+    let fallback = format!("in{}", voltage.index);
+    ui.horizontal(|ui| {
+        let label = voltage.label.as_deref().unwrap_or(&fallback);
+        ui.add_sized(
+            egui::vec2(120.0, 16.0),
+            egui::Label::new(
+                RichText::new(label)
+                    .font(FontId::proportional(11.0))
+                    .color(theme.ui.secondary_text),
+            ),
+        );
+        match voltage.volts() {
+            Some(volts) => {
+                ui.label(
+                    RichText::new(format!("{volts:.3} V"))
+                        .font(FontId::monospace(11.0))
+                        .color(theme.ui.text),
+                );
+            }
+            None => {
+                ui.label(
+                    RichText::new("Unavailable")
+                        .font(FontId::proportional(11.0))
+                        .color(theme.status.warning),
+                );
+            }
+        }
+        ui.label(
+            RichText::new(format!("({})", device.name))
+                .font(FontId::proportional(9.0))
+                .color(theme.ui.secondary_text),
+        );
+    });
+}
+
+fn current_row(
+    ui: &mut Ui,
+    context: &SectionContext<'_>,
+    device: &HwmonDevice,
+    current: &CurrentSensor,
+) {
+    let theme = context.theme;
+    let fallback = format!("curr{}", current.index);
+    ui.horizontal(|ui| {
+        let label = current.label.as_deref().unwrap_or(&fallback);
+        ui.add_sized(
+            egui::vec2(120.0, 16.0),
+            egui::Label::new(
+                RichText::new(label)
+                    .font(FontId::proportional(11.0))
+                    .color(theme.ui.secondary_text),
+            ),
+        );
+        match current.amps() {
+            Some(amps) => {
+                ui.label(
+                    RichText::new(format!("{amps:.3} A"))
+                        .font(FontId::monospace(11.0))
+                        .color(theme.ui.text),
+                );
+            }
+            None => {
+                ui.label(
+                    RichText::new("Unavailable")
+                        .font(FontId::proportional(11.0))
+                        .color(theme.status.warning),
+                );
+            }
+        }
+        ui.label(
+            RichText::new(format!("({})", device.name))
+                .font(FontId::proportional(9.0))
+                .color(theme.ui.secondary_text),
+        );
+    });
 }
 
 fn stat_line_colored(

@@ -6,6 +6,7 @@
 
 pub mod dashboard;
 pub mod gpu;
+pub mod hwmon;
 pub mod metrics;
 pub mod network;
 pub mod process;
@@ -16,6 +17,7 @@ use super::{Section, SectionContext, SectionId};
 use crate::theme::Theme;
 use eframe::egui;
 use gpu::GpuMonitor;
+use hwmon::HwmonMonitor;
 use metrics::{
     CpuTicks, SystemInfo, SystemMetrics, collect_system_info, cpu_usage_delta, read_cpu_ticks,
     read_memory_kib, read_uptime_secs,
@@ -41,6 +43,7 @@ pub struct SystemSection {
     process_monitor: process::ProcessMonitor,
     network: network::NetworkMonitor,
     thermal: ThermalMonitor,
+    hwmon: HwmonMonitor,
     prev_cpu: Option<CpuTicks>,
     cpu_history: VecDeque<f32>,
     ram_history: VecDeque<f32>,
@@ -49,6 +52,7 @@ pub struct SystemSection {
     read_history: VecDeque<f32>,
     write_history: VecDeque<f32>,
     thermal_history: VecDeque<f32>,
+    fan_history: VecDeque<f32>,
     last_collect: Option<Instant>,
 }
 
@@ -62,6 +66,7 @@ impl SystemSection {
             process_monitor: process::ProcessMonitor::new(),
             network: network::NetworkMonitor::new(),
             thermal: ThermalMonitor::new(),
+            hwmon: HwmonMonitor::new(),
             prev_cpu: None,
             cpu_history: VecDeque::with_capacity(HISTORY_LEN),
             ram_history: VecDeque::with_capacity(HISTORY_LEN),
@@ -70,6 +75,7 @@ impl SystemSection {
             read_history: VecDeque::with_capacity(HISTORY_LEN),
             write_history: VecDeque::with_capacity(HISTORY_LEN),
             thermal_history: VecDeque::with_capacity(HISTORY_LEN),
+            fan_history: VecDeque::with_capacity(HISTORY_LEN),
             last_collect: None,
         }
     }
@@ -137,6 +143,11 @@ impl SystemSection {
             push_history(&mut self.thermal_history, max_temp);
         }
 
+        self.hwmon.poll();
+        if let Some(rpm) = self.hwmon.primary_fan_rpm() {
+            push_history(&mut self.fan_history, rpm as f32);
+        }
+
         self.metrics.uptime_secs = read_uptime_secs();
     }
 }
@@ -173,6 +184,7 @@ impl Section for SystemSection {
         let read_history = self.read_history.make_contiguous();
         let write_history = self.write_history.make_contiguous();
         let thermal_history = self.thermal_history.make_contiguous();
+        let fan_history = self.fan_history.make_contiguous();
         egui::ScrollArea::vertical()
             .id_salt("system-dashboard")
             .auto_shrink([false, false])
@@ -191,6 +203,8 @@ impl Section for SystemSection {
                     write_history,
                     &self.thermal,
                     thermal_history,
+                    &self.hwmon,
+                    fan_history,
                     &mut self.process_monitor,
                     &mut self.network,
                 );
@@ -233,5 +247,6 @@ mod tests {
         assert!(section.read_history.len() <= HISTORY_LEN);
         assert!(section.write_history.len() <= HISTORY_LEN);
         assert!(section.thermal_history.len() <= HISTORY_LEN);
+        assert!(section.fan_history.len() <= HISTORY_LEN);
     }
 }
