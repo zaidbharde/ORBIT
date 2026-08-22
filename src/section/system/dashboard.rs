@@ -38,6 +38,7 @@ pub fn show(
     fan_history: &[f32],
     process_monitor: &mut super::process::ProcessMonitor,
     network_monitor: &mut super::network::NetworkMonitor,
+    command_builder: &mut super::command_builder::CommandBuilder,
 ) {
     ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
     ui.columns(2, |columns| {
@@ -62,6 +63,7 @@ pub fn show(
     info_card(ui, context, info, metrics);
     super::network::show_network_card(ui, context, network_monitor);
     super::process::show_process_card(ui, context, process_monitor);
+    super::command_builder::show_command_builder_card(ui, context, command_builder);
 }
 
 fn card(ui: &mut Ui, context: &SectionContext<'_>, title: &str, add: impl FnOnce(&mut Ui)) {
