@@ -3,12 +3,7 @@
 //! dependencies); GPU telemetry comes from the read-only NVIDIA backend in
 //! [`gpu`]. Metrics are collected in `update()` — the dashboard render
 //! path only reads cached values.
-//!
-//! P6.2 adds a Command Builder panel for safe process execution. Commands
-//! are built with explicit program + arguments (never through a shell) and
-//! executed on a background thread so the UI never blocks.
 
-pub mod command_builder;
 pub mod dashboard;
 pub mod gpu;
 pub mod hwmon;
@@ -49,7 +44,6 @@ pub struct SystemSection {
     network: network::NetworkMonitor,
     thermal: ThermalMonitor,
     hwmon: HwmonMonitor,
-    command_builder: command_builder::CommandBuilder,
     prev_cpu: Option<CpuTicks>,
     cpu_history: VecDeque<f32>,
     ram_history: VecDeque<f32>,
@@ -73,7 +67,6 @@ impl SystemSection {
             network: network::NetworkMonitor::new(),
             thermal: ThermalMonitor::new(),
             hwmon: HwmonMonitor::new(),
-            command_builder: command_builder::CommandBuilder::new(),
             prev_cpu: None,
             cpu_history: VecDeque::with_capacity(HISTORY_LEN),
             ram_history: VecDeque::with_capacity(HISTORY_LEN),
@@ -187,8 +180,6 @@ impl Section for SystemSection {
         // P6.1: Auto-clear action result after 4 seconds.
         self.process_monitor
             .clear_old_action_result(Duration::from_secs(4));
-        // P6.2: Poll command builder for output from background threads.
-        self.command_builder.poll_output();
     }
 
     fn render(&mut self, ui: &mut egui::Ui, context: &SectionContext<'_>) -> egui::Response {
@@ -222,7 +213,6 @@ impl Section for SystemSection {
                     fan_history,
                     &mut self.process_monitor,
                     &mut self.network,
-                    &mut self.command_builder,
                 );
                 ui.response()
             })

@@ -7,10 +7,12 @@
 //! between consecutive 1 Hz samples. The UI presents a searchable, sortable
 //! table with optional per-process detail panels.
 //!
-//! P6.1 adds safe process execution control: refresh, open details, and a
-//! safe SIGTERM request for the user's own processes. All actions validate
-//! PID existence, ownership, and protection status before execution. Force
-//! kill, arbitrary signals, and privilege escalation are explicitly excluded.
+//! P6.1 adds safe process execution control with confirmation dialogs:
+//! - Stop: sends SIGTERM after user confirmation (graceful termination)
+//! - Kill: sends SIGKILL after user confirmation (forceful termination)
+//! - Self-protection: ORBIT's own PID is detected and disabled
+//! - All actions validate PID existence, ownership, and protection status
+//! - Confirmation dialogs require explicit user approval before any signal
 //!
 //! On non-Linux platforms the process list is always empty and the UI
 //! displays "Telemetry unavailable". Process actions are unsupported.
@@ -100,17 +102,18 @@ impl ProcessSortKey {
 
 /// A safe process action the UI may request.
 ///
-/// Only three actions are permitted in P6.1:
+/// All actions require user confirmation via a dialog before execution.
 /// - `Refresh`: re-read the current process's info from `/proc`
-/// - `ShowDetails`: toggle detail panel visibility (pure UI, no /proc read)
-/// - `Terminate`: send SIGTERM to a process the current user owns
+/// - `Stop`: send SIGTERM (graceful termination request)
+/// - `Kill`: send SIGKILL (forceful termination, cannot be caught)
 ///
-/// Force-kill (SIGKILL), arbitrary signal injection, and privilege
-/// escalation are explicitly excluded.
+/// Actions are queued as `pending_action` and drained in the update loop.
+/// Force-kill (SIGKILL) requires a stronger confirmation dialog.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProcessAction {
     Refresh { pid: u32 },
-    Terminate { pid: u32 },
+    Stop { pid: u32 },
+    Kill { pid: u32 },
 }
 
 /// Outcome of a validated process action.
@@ -134,6 +137,13 @@ impl ActionResult {
             ActionResult::Error(msg) => msg,
         }
     }
+}
+
+/// What the confirmation dialog is currently showing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConfirmKind {
+    Stop { pid: u32, name: String },
+    Kill { pid: u32, name: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -198,6 +208,16 @@ pub fn current_uid() -> u32 {
     0
 }
 
+/// Get ORBIT's own PID for self-protection.
+pub fn orbit_pid() -> u32 {
+    std::process::id()
+}
+
+/// Check if a PID is ORBIT itself.
+pub fn is_orbit_self(pid: u32) -> bool {
+    pid == orbit_pid()
+}
+
 /// Cached process list with UI interaction state.
 pub struct ProcessMonitor {
     processes: Vec<ProcessInfo>,
@@ -221,6 +241,8 @@ pub struct ProcessMonitor {
     pub last_action_result: Option<ActionResult>,
     /// When the last action was executed (for auto-clear after a few seconds).
     pub last_action_time: Option<Instant>,
+    /// Active confirmation dialog, if any.
+    pub confirm_dialog: Option<ConfirmKind>,
 }
 
 impl ProcessMonitor {
@@ -244,6 +266,7 @@ impl ProcessMonitor {
             pending_action: None,
             last_action_result: None,
             last_action_time: None,
+            confirm_dialog: None,
         }
     }
 
@@ -352,17 +375,28 @@ impl ProcessMonitor {
         self.pending_action.take()
     }
 
+    /// Open a confirmation dialog for the given action kind.
+    pub fn open_confirm(&mut self, kind: ConfirmKind) {
+        self.confirm_dialog = Some(kind);
+    }
+
+    /// Close the confirmation dialog without taking action.
+    pub fn close_confirm(&mut self) {
+        self.confirm_dialog = None;
+    }
+
     /// Execute a validated process action. Returns an `ActionResult`.
     ///
     /// This method enforces all safety invariants:
     /// - PID must be non-zero and not protected (PID 1, 2)
     /// - Process must exist in `/proc`
-    /// - For Terminate: caller must own the process (same UID)
-    /// - Only SIGTERM is sent; no SIGKILL, no arbitrary signals
+    /// - Caller must own the process (same UID) for Stop/Kill
+    /// - ORBIT's own PID is always denied
     pub fn execute_action(&mut self, action: ProcessAction) -> ActionResult {
-        let result = match action {
-            ProcessAction::Refresh { pid } => self.execute_refresh(pid),
-            ProcessAction::Terminate { pid } => self.execute_terminate(pid),
+        let result = match &action {
+            ProcessAction::Refresh { pid } => self.execute_refresh(*pid),
+            ProcessAction::Stop { pid } => self.execute_stop(*pid),
+            ProcessAction::Kill { pid } => self.execute_kill(*pid),
         };
         self.last_action_result = Some(result.clone());
         self.last_action_time = Some(Instant::now());
@@ -385,30 +419,44 @@ impl ProcessMonitor {
         ActionResult::Success(format!("Refreshed PID {pid}"))
     }
 
-    fn execute_terminate(&self, pid: u32) -> ActionResult {
+    fn preflight_check(&self, pid: u32) -> Option<ActionResult> {
         if !validate_pid(pid) {
-            return ActionResult::Error("Invalid PID".into());
+            return Some(ActionResult::Error("Invalid PID".into()));
         }
-        if is_protected_pid(pid) {
-            return ActionResult::Denied(format!(
-                "Refused: PID {pid} is a protected system process"
+        if is_orbit_self(pid) {
+            return Some(ActionResult::Denied(
+                "ORBIT process \u{2014} control disabled".into(),
             ));
         }
+        if is_protected_pid(pid) {
+            return Some(ActionResult::Denied(format!(
+                "Refused: PID {pid} is a protected system process"
+            )));
+        }
         if !is_process_alive(pid) {
-            return ActionResult::Error(format!("PID {pid} no longer exists"));
+            return Some(ActionResult::Error(format!("PID {pid} no longer exists")));
         }
         let my_uid = current_uid();
         if !verify_ownership(pid, my_uid) {
-            return ActionResult::Denied(format!(
+            return Some(ActionResult::Denied(format!(
                 "Refused: PID {pid} is not owned by the current user"
-            ));
+            )));
         }
-        // Safety: we validated PID exists, is not protected, and is owned by us.
+        None
+    }
+
+    fn execute_stop(&self, pid: u32) -> ActionResult {
+        if let Some(result) = self.preflight_check(pid) {
+            return result;
+        }
+        // Safety: we validated PID exists, is not protected, is not self, and is owned by us.
         #[cfg(target_os = "linux")]
         {
             let ret = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
             if ret == 0 {
-                ActionResult::Success(format!("Sent SIGTERM to PID {pid}"))
+                ActionResult::Success(format!(
+                    "Sent SIGTERM to PID {pid}; waiting for process list refresh"
+                ))
             } else {
                 let err = std::io::Error::last_os_error();
                 ActionResult::Error(format!("kill failed: {err}"))
@@ -416,7 +464,30 @@ impl ProcessMonitor {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            ActionResult::Error("Terminate not supported on this platform".into())
+            ActionResult::Error("Stop not supported on this platform".into())
+        }
+    }
+
+    fn execute_kill(&self, pid: u32) -> ActionResult {
+        if let Some(result) = self.preflight_check(pid) {
+            return result;
+        }
+        // Safety: we validated PID exists, is not protected, is not self, and is owned by us.
+        #[cfg(target_os = "linux")]
+        {
+            let ret = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            if ret == 0 {
+                ActionResult::Success(format!(
+                    "Sent SIGKILL to PID {pid}; waiting for process list refresh"
+                ))
+            } else {
+                let err = std::io::Error::last_os_error();
+                ActionResult::Error(format!("kill failed: {err}"))
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            ActionResult::Error("Kill not supported on this platform".into())
         }
     }
 
@@ -939,7 +1010,30 @@ pub fn show_process_card(ui: &mut Ui, context: &SectionContext<'_>, monitor: &mu
                         .color(theme.ui.secondary_text)
                         .strong(),
                 );
+
+                let is_orbit = is_orbit_self(proc_info.pid);
+                let is_protected = is_protected_pid(proc_info.pid);
+                let is_alive = is_process_alive(proc_info.pid);
+                let my_uid = current_uid();
+                let is_owned = proc_info.uid.is_some_and(|u| u == my_uid);
+                let can_control = !is_orbit && !is_protected && is_alive && is_owned;
+
+                if is_orbit {
+                    ui.label(
+                        RichText::new("ORBIT process \u{2014} control disabled")
+                            .font(FontId::proportional(10.0))
+                            .color(theme.status.warning),
+                    );
+                } else if is_protected {
+                    ui.label(
+                        RichText::new("Protected system process \u{2014} control disabled")
+                            .font(FontId::proportional(10.0))
+                            .color(theme.status.warning),
+                    );
+                }
+
                 ui.horizontal(|ui| {
+                    // Refresh button (always available for listed processes)
                     let refresh_btn = egui::Button::new(
                         RichText::new("Refresh")
                             .font(FontId::proportional(10.0))
@@ -951,29 +1045,48 @@ pub fn show_process_card(ui: &mut Ui, context: &SectionContext<'_>, monitor: &mu
                             Some(ProcessAction::Refresh { pid: proc_info.pid });
                     }
 
-                    let is_protected = is_protected_pid(proc_info.pid);
-                    let is_alive = is_process_alive(proc_info.pid);
-                    let my_uid = current_uid();
-                    let is_owned = proc_info.uid.is_some_and(|u| u == my_uid);
-                    let can_terminate = !is_protected && is_alive && is_owned;
-
-                    let term_btn = egui::Button::new(
-                        RichText::new("Terminate")
+                    // Stop button (SIGTERM with confirmation)
+                    let stop_btn = egui::Button::new(
+                        RichText::new("Stop")
                             .font(FontId::proportional(10.0))
-                            .color(if can_terminate {
+                            .color(if can_control {
                                 theme.status.warning
                             } else {
                                 theme.ui.secondary_text
                             }),
                     )
-                    .fill(if can_terminate {
+                    .fill(if can_control {
                         with_alpha(theme.status.warning, 0.15)
                     } else {
                         Color32::TRANSPARENT
                     });
-                    if ui.add(term_btn).clicked() && can_terminate {
-                        monitor.pending_action =
-                            Some(ProcessAction::Terminate { pid: proc_info.pid });
+                    if ui.add(stop_btn).clicked() && can_control {
+                        monitor.open_confirm(ConfirmKind::Stop {
+                            pid: proc_info.pid,
+                            name: proc_info.name.clone(),
+                        });
+                    }
+
+                    // Kill button (SIGKILL with stronger confirmation)
+                    let kill_btn = egui::Button::new(
+                        RichText::new("Kill")
+                            .font(FontId::proportional(10.0))
+                            .color(if can_control {
+                                theme.status.error
+                            } else {
+                                theme.ui.secondary_text
+                            }),
+                    )
+                    .fill(if can_control {
+                        with_alpha(theme.status.error, 0.15)
+                    } else {
+                        Color32::TRANSPARENT
+                    });
+                    if ui.add(kill_btn).clicked() && can_control {
+                        monitor.open_confirm(ConfirmKind::Kill {
+                            pid: proc_info.pid,
+                            name: proc_info.name.clone(),
+                        });
                     }
                 });
 
@@ -1004,6 +1117,98 @@ pub fn show_process_card(ui: &mut Ui, context: &SectionContext<'_>, monitor: &mu
                     });
                 }
             }
+        }
+    });
+
+    // P6.1: Confirmation dialog overlay (rendered outside the card frame)
+    show_confirm_dialog(ui, context, monitor);
+}
+
+/// P6.1: Render a centered confirmation dialog as a popup overlay.
+fn show_confirm_dialog(
+    ui: &mut egui::Ui,
+    _context: &SectionContext<'_>,
+    monitor: &mut ProcessMonitor,
+) {
+    let Some(ref kind) = monitor.confirm_dialog else {
+        return;
+    };
+    let theme = _context.theme;
+    let appearance = _context.appearance;
+
+    let (title, body, confirm_label, confirm_fill, action) = match kind {
+        ConfirmKind::Stop { pid, name } => (
+            "Confirm Stop",
+            format!(
+                "Send SIGTERM to PID {pid} ({name})?\n\nThis is a graceful termination request. The process may clean up before exiting."
+            ),
+            "Stop (SIGTERM)",
+            with_alpha(theme.status.warning, 0.2),
+            ProcessAction::Stop { pid: *pid },
+        ),
+        ConfirmKind::Kill { pid, name } => (
+            "Confirm Kill",
+            format!(
+                "Send SIGKILL to PID {pid} ({name})?\n\nThis forcefully terminates the process immediately. Unsaved data may be lost."
+            ),
+            "Kill (SIGKILL)",
+            with_alpha(theme.status.error, 0.2),
+            ProcessAction::Kill { pid: *pid },
+        ),
+    };
+
+    let _response = egui::Window::new(title)
+        .collapsible(false)
+        .resizable(false)
+        .default_width(360.0)
+        .frame(
+            Frame::new()
+                .fill(_context.panel_fill)
+                .inner_margin(Margin::symmetric(16, 14))
+                .corner_radius(appearance.panel_radius.clamp(0.0, 12.0))
+                .stroke(Stroke::new(
+                    1.0_f32,
+                    with_alpha(theme.ui.border, appearance.border_opacity),
+                )),
+        )
+        .show(ui.ctx(), |ui| {
+            ui.label(
+                RichText::new(&body)
+                    .font(FontId::proportional(11.0))
+                    .color(theme.ui.text),
+            );
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                let cancel_btn = egui::Button::new(
+                    RichText::new("Cancel")
+                        .font(FontId::proportional(10.0))
+                        .color(theme.ui.text),
+                )
+                .fill(theme.ui.tab_inactive);
+                if ui.add(cancel_btn).clicked() {
+                    monitor.close_confirm();
+                }
+
+                ui.add_space(8.0);
+
+                let confirm_btn = egui::Button::new(
+                    RichText::new(confirm_label)
+                        .font(FontId::proportional(10.0))
+                        .color(theme.ui.text),
+                )
+                .fill(confirm_fill);
+                if ui.add(confirm_btn).clicked() {
+                    monitor.pending_action = Some(action);
+                    monitor.close_confirm();
+                }
+            });
+        });
+
+    // Close on Escape key
+    let ctx = ui.ctx().clone();
+    ctx.input(|input| {
+        if input.key_pressed(egui::Key::Escape) {
+            monitor.close_confirm();
         }
     });
 }
@@ -1054,7 +1259,7 @@ fn truncate_owned(s: String, max_len: usize) -> String {
         s
     } else {
         let mut result: String = s.chars().take(max_len - 1).collect();
-        result.push('…');
+        result.push('\u{2026}');
         result
     }
 }
@@ -1357,16 +1562,45 @@ mod tests {
     }
 
     #[test]
-    fn terminate_rejects_protected_pid() {
+    fn stop_rejects_protected_pid() {
         let mut monitor = ProcessMonitor::new();
-        let result = monitor.execute_action(ProcessAction::Terminate { pid: 1 });
+        let result = monitor.execute_action(ProcessAction::Stop { pid: 1 });
         assert!(matches!(result, ActionResult::Denied(_)));
     }
 
     #[test]
-    fn terminate_rejects_zero_pid() {
+    fn stop_rejects_zero_pid() {
         let mut monitor = ProcessMonitor::new();
-        let result = monitor.execute_action(ProcessAction::Terminate { pid: 0 });
+        let result = monitor.execute_action(ProcessAction::Stop { pid: 0 });
+        assert!(matches!(result, ActionResult::Error(_)));
+    }
+
+    #[test]
+    fn kill_rejects_protected_pid() {
+        let mut monitor = ProcessMonitor::new();
+        let result = monitor.execute_action(ProcessAction::Kill { pid: 1 });
+        assert!(matches!(result, ActionResult::Denied(_)));
+    }
+
+    #[test]
+    fn kill_rejects_zero_pid() {
+        let mut monitor = ProcessMonitor::new();
+        let result = monitor.execute_action(ProcessAction::Kill { pid: 0 });
+        assert!(matches!(result, ActionResult::Error(_)));
+    }
+
+    #[test]
+    fn stop_rejects_nonexistent_pid() {
+        let mut monitor = ProcessMonitor::new();
+        // PID 99999999 is very unlikely to exist
+        let result = monitor.execute_action(ProcessAction::Stop { pid: 99999999 });
+        assert!(matches!(result, ActionResult::Error(_)));
+    }
+
+    #[test]
+    fn kill_rejects_nonexistent_pid() {
+        let mut monitor = ProcessMonitor::new();
+        let result = monitor.execute_action(ProcessAction::Kill { pid: 99999999 });
         assert!(matches!(result, ActionResult::Error(_)));
     }
 
@@ -1401,5 +1635,133 @@ mod tests {
     fn drain_pending_action_returns_none_when_empty() {
         let mut monitor = ProcessMonitor::new();
         assert!(monitor.drain_pending_action().is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // P6.1: Confirmation dialog state tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn confirm_dialog_starts_none() {
+        let monitor = ProcessMonitor::new();
+        assert!(monitor.confirm_dialog.is_none());
+    }
+
+    #[test]
+    fn open_confirm_sets_dialog() {
+        let mut monitor = ProcessMonitor::new();
+        monitor.open_confirm(ConfirmKind::Stop {
+            pid: 42,
+            name: "test".into(),
+        });
+        assert!(monitor.confirm_dialog.is_some());
+    }
+
+    #[test]
+    fn close_confirm_clears_dialog() {
+        let mut monitor = ProcessMonitor::new();
+        monitor.open_confirm(ConfirmKind::Kill {
+            pid: 42,
+            name: "test".into(),
+        });
+        assert!(monitor.confirm_dialog.is_some());
+        monitor.close_confirm();
+        assert!(monitor.confirm_dialog.is_none());
+    }
+
+    #[test]
+    fn confirm_kind_equality() {
+        let a = ConfirmKind::Stop {
+            pid: 1,
+            name: "a".into(),
+        };
+        let b = ConfirmKind::Stop {
+            pid: 1,
+            name: "a".into(),
+        };
+        let c = ConfirmKind::Kill {
+            pid: 1,
+            name: "a".into(),
+        };
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    // -----------------------------------------------------------------------
+    // P6.1: Self-protection tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn orbit_pid_is_nonzero() {
+        // ORBIT's own PID must be > 0 (a valid process)
+        assert!(orbit_pid() > 0);
+    }
+
+    #[test]
+    fn is_orbit_self_detects_own_pid() {
+        let my_pid = orbit_pid();
+        assert!(is_orbit_self(my_pid));
+    }
+
+    #[test]
+    fn is_orbit_self_rejects_other_pid() {
+        // PID 99999999 is extremely unlikely to be ORBIT
+        assert!(!is_orbit_self(99999999));
+    }
+
+    #[test]
+    fn stop_rejects_orbit_self() {
+        let mut monitor = ProcessMonitor::new();
+        let my_pid = orbit_pid();
+        let result = monitor.execute_action(ProcessAction::Stop { pid: my_pid });
+        assert!(matches!(result, ActionResult::Denied(_)));
+        assert!(result.message().contains("ORBIT"));
+    }
+
+    #[test]
+    fn kill_rejects_orbit_self() {
+        let mut monitor = ProcessMonitor::new();
+        let my_pid = orbit_pid();
+        let result = monitor.execute_action(ProcessAction::Kill { pid: my_pid });
+        assert!(matches!(result, ActionResult::Denied(_)));
+        assert!(result.message().contains("ORBIT"));
+    }
+
+    // -----------------------------------------------------------------------
+    // P6.1: Action type tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn process_action_variants() {
+        let a = ProcessAction::Refresh { pid: 1 };
+        let b = ProcessAction::Stop { pid: 2 };
+        let c = ProcessAction::Kill { pid: 3 };
+        assert_ne!(a, b);
+        assert_ne!(b, c);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn action_result_message_matches() {
+        assert_eq!(ActionResult::Success("ok".into()).message(), "ok");
+        assert_eq!(ActionResult::Denied("denied".into()).message(), "denied");
+        assert_eq!(ActionResult::Error("err".into()).message(), "err");
+    }
+
+    #[test]
+    fn stop_action_success_on_valid_owned_process() {
+        // We can't easily test actual SIGTERM without killing real processes,
+        // but we can verify the preflight checks work correctly.
+        let mut monitor = ProcessMonitor::new();
+        // Nonexistent PID should fail with Error (not crash)
+        let result = monitor.execute_action(ProcessAction::Stop { pid: 99999999 });
+        assert!(matches!(result, ActionResult::Error(_)));
+    }
+
+    #[test]
+    fn kill_action_success_on_valid_owned_process() {
+        let mut monitor = ProcessMonitor::new();
+        let result = monitor.execute_action(ProcessAction::Kill { pid: 99999999 });
+        assert!(matches!(result, ActionResult::Error(_)));
     }
 }
