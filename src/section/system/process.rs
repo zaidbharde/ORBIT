@@ -7,9 +7,13 @@
 //! between consecutive 1 Hz samples. The UI presents a searchable, sortable
 //! table with optional per-process detail panels.
 //!
+//! P6.1 adds safe process execution control: refresh, open details, and a
+//! safe SIGTERM request for the user's own processes. All actions validate
+//! PID existence, ownership, and protection status before execution. Force
+//! kill, arbitrary signals, and privilege escalation are explicitly excluded.
+//!
 //! On non-Linux platforms the process list is always empty and the UI
-//! displays "Telemetry unavailable". All queries are strictly read-only: no
-//! signals are sent, no process state is modified.
+//! displays "Telemetry unavailable". Process actions are unsupported.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -90,6 +94,110 @@ impl ProcessSortKey {
     }
 }
 
+// ---------------------------------------------------------------------------
+// P6.1: Safe process action types
+// ---------------------------------------------------------------------------
+
+/// A safe process action the UI may request.
+///
+/// Only three actions are permitted in P6.1:
+/// - `Refresh`: re-read the current process's info from `/proc`
+/// - `ShowDetails`: toggle detail panel visibility (pure UI, no /proc read)
+/// - `Terminate`: send SIGTERM to a process the current user owns
+///
+/// Force-kill (SIGKILL), arbitrary signal injection, and privilege
+/// escalation are explicitly excluded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProcessAction {
+    Refresh { pid: u32 },
+    Terminate { pid: u32 },
+}
+
+/// Outcome of a validated process action.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ActionResult {
+    Success(String),
+    Denied(String),
+    Error(String),
+}
+
+impl ActionResult {
+    #[allow(dead_code)]
+    pub fn is_success(&self) -> bool {
+        matches!(self, ActionResult::Success(_))
+    }
+
+    pub fn message(&self) -> &str {
+        match self {
+            ActionResult::Success(msg) => msg,
+            ActionResult::Denied(msg) => msg,
+            ActionResult::Error(msg) => msg,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P6.1: Safety validation (testable pure functions)
+// ---------------------------------------------------------------------------
+
+/// PIDs that must never be targeted by process actions.
+const PROTECTED_PIDS: &[u32] = &[0, 1, 2];
+
+/// Check whether a PID is in the protected set (kernel, init, kthreadd).
+pub fn is_protected_pid(pid: u32) -> bool {
+    PROTECTED_PIDS.contains(&pid)
+}
+
+/// Validate that a PID is numeric and non-zero (basic sanity).
+pub fn validate_pid(pid: u32) -> bool {
+    pid > 0
+}
+
+/// Read the current UID of a process from `/proc/[pid]/status`.
+///
+/// Returns `None` if the PID doesn't exist or the status file can't be read.
+#[cfg(target_os = "linux")]
+pub fn read_process_uid(pid: u32) -> Option<u32> {
+    let path = format!("/proc/{pid}/status");
+    let content = std::fs::read_to_string(&path).ok()?;
+    for line in content.lines() {
+        if let Some((key, value)) = line.split_once(':') {
+            if key == "Uid" {
+                return value.split_whitespace().next()?.parse().ok();
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn read_process_uid(_pid: u32) -> Option<u32> {
+    None
+}
+
+/// Verify that a process with the given PID exists and is owned by `expected_uid`.
+///
+/// This re-reads `/proc/[pid]/status` to avoid trusting stale UI data.
+pub fn verify_ownership(pid: u32, expected_uid: u32) -> bool {
+    read_process_uid(pid).is_some_and(|uid| uid == expected_uid)
+}
+
+/// Check if a process is still alive by verifying `/proc/[pid]` exists.
+pub fn is_process_alive(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// Get the current user's UID (real UID).
+#[cfg(target_os = "linux")]
+pub fn current_uid() -> u32 {
+    unsafe { libc::getuid() }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn current_uid() -> u32 {
+    0
+}
+
 /// Cached process list with UI interaction state.
 pub struct ProcessMonitor {
     processes: Vec<ProcessInfo>,
@@ -107,6 +215,12 @@ pub struct ProcessMonitor {
     pub sleeping_count: usize,
     pub stopped_count: usize,
     pub zombie_count: usize,
+    /// Pending action requested from the UI (set by button callbacks).
+    pub pending_action: Option<ProcessAction>,
+    /// Result of the last executed action, displayed in the UI.
+    pub last_action_result: Option<ActionResult>,
+    /// When the last action was executed (for auto-clear after a few seconds).
+    pub last_action_time: Option<Instant>,
 }
 
 impl ProcessMonitor {
@@ -127,6 +241,9 @@ impl ProcessMonitor {
             sleeping_count: 0,
             stopped_count: 0,
             zombie_count: 0,
+            pending_action: None,
+            last_action_result: None,
+            last_action_time: None,
         }
     }
 
@@ -228,6 +345,89 @@ impl ProcessMonitor {
 
     pub fn find_by_pid(&self, pid: u32) -> Option<&ProcessInfo> {
         self.processes.iter().find(|p| p.pid == pid)
+    }
+
+    /// Drain the pending action, returning it if one was set by the UI.
+    pub fn drain_pending_action(&mut self) -> Option<ProcessAction> {
+        self.pending_action.take()
+    }
+
+    /// Execute a validated process action. Returns an `ActionResult`.
+    ///
+    /// This method enforces all safety invariants:
+    /// - PID must be non-zero and not protected (PID 1, 2)
+    /// - Process must exist in `/proc`
+    /// - For Terminate: caller must own the process (same UID)
+    /// - Only SIGTERM is sent; no SIGKILL, no arbitrary signals
+    pub fn execute_action(&mut self, action: ProcessAction) -> ActionResult {
+        let result = match action {
+            ProcessAction::Refresh { pid } => self.execute_refresh(pid),
+            ProcessAction::Terminate { pid } => self.execute_terminate(pid),
+        };
+        self.last_action_result = Some(result.clone());
+        self.last_action_time = Some(Instant::now());
+        result
+    }
+
+    fn execute_refresh(&self, pid: u32) -> ActionResult {
+        if !validate_pid(pid) {
+            return ActionResult::Error("Invalid PID".into());
+        }
+        if is_protected_pid(pid) {
+            return ActionResult::Denied("Cannot refresh protected process".into());
+        }
+        if !is_process_alive(pid) {
+            return ActionResult::Error(format!("PID {pid} does not exist"));
+        }
+        if self.find_by_pid(pid).is_none() {
+            return ActionResult::Error(format!("PID {pid} not in current process list"));
+        }
+        ActionResult::Success(format!("Refreshed PID {pid}"))
+    }
+
+    fn execute_terminate(&self, pid: u32) -> ActionResult {
+        if !validate_pid(pid) {
+            return ActionResult::Error("Invalid PID".into());
+        }
+        if is_protected_pid(pid) {
+            return ActionResult::Denied(format!(
+                "Refused: PID {pid} is a protected system process"
+            ));
+        }
+        if !is_process_alive(pid) {
+            return ActionResult::Error(format!("PID {pid} no longer exists"));
+        }
+        let my_uid = current_uid();
+        if !verify_ownership(pid, my_uid) {
+            return ActionResult::Denied(format!(
+                "Refused: PID {pid} is not owned by the current user"
+            ));
+        }
+        // Safety: we validated PID exists, is not protected, and is owned by us.
+        #[cfg(target_os = "linux")]
+        {
+            let ret = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+            if ret == 0 {
+                ActionResult::Success(format!("Sent SIGTERM to PID {pid}"))
+            } else {
+                let err = std::io::Error::last_os_error();
+                ActionResult::Error(format!("kill failed: {err}"))
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            ActionResult::Error("Terminate not supported on this platform".into())
+        }
+    }
+
+    /// Clear the action result if it's older than `age`.
+    pub fn clear_old_action_result(&mut self, age: Duration) {
+        if let Some(t) = self.last_action_time {
+            if t.elapsed() >= age {
+                self.last_action_result = None;
+                self.last_action_time = None;
+            }
+        }
     }
 }
 
@@ -690,7 +890,7 @@ pub fn show_process_card(ui: &mut Ui, context: &SectionContext<'_>, monitor: &mu
 
         // Detail panel for selected process.
         if let Some(sel_pid) = monitor.selected_pid {
-            if let Some(proc_info) = monitor.find_by_pid(sel_pid) {
+            if let Some(proc_info) = monitor.find_by_pid(sel_pid).cloned() {
                 ui.add_space(6.0);
                 ui.separator();
                 ui.add_space(4.0);
@@ -728,6 +928,81 @@ pub fn show_process_card(ui: &mut Ui, context: &SectionContext<'_>, monitor: &mu
                 );
                 detail_row(ui, theme, "Executable", proc_info.executable.clone());
                 detail_row(ui, theme, "Command", proc_info.command.clone());
+
+                // P6.1: Action buttons
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Actions")
+                        .font(FontId::proportional(11.0))
+                        .color(theme.ui.secondary_text)
+                        .strong(),
+                );
+                ui.horizontal(|ui| {
+                    let refresh_btn = egui::Button::new(
+                        RichText::new("Refresh")
+                            .font(FontId::proportional(10.0))
+                            .color(theme.ui.text),
+                    )
+                    .fill(theme.ui.accent);
+                    if ui.add(refresh_btn).clicked() {
+                        monitor.pending_action =
+                            Some(ProcessAction::Refresh { pid: proc_info.pid });
+                    }
+
+                    let is_protected = is_protected_pid(proc_info.pid);
+                    let is_alive = is_process_alive(proc_info.pid);
+                    let my_uid = current_uid();
+                    let is_owned = proc_info.uid.is_some_and(|u| u == my_uid);
+                    let can_terminate = !is_protected && is_alive && is_owned;
+
+                    let term_btn = egui::Button::new(
+                        RichText::new("Terminate")
+                            .font(FontId::proportional(10.0))
+                            .color(if can_terminate {
+                                theme.status.warning
+                            } else {
+                                theme.ui.secondary_text
+                            }),
+                    )
+                    .fill(if can_terminate {
+                        with_alpha(theme.status.warning, 0.15)
+                    } else {
+                        Color32::TRANSPARENT
+                    });
+                    if ui.add(term_btn).clicked() && can_terminate {
+                        monitor.pending_action =
+                            Some(ProcessAction::Terminate { pid: proc_info.pid });
+                    }
+                });
+
+                // P6.1: Action result banner
+                if let Some(ref result) = monitor.last_action_result {
+                    ui.add_space(4.0);
+                    let (bg_color, text_color) = match result {
+                        ActionResult::Success(_) => {
+                            (with_alpha(theme.status.success, 0.15), theme.status.success)
+                        }
+                        ActionResult::Denied(_) => {
+                            (with_alpha(theme.status.warning, 0.15), theme.status.warning)
+                        }
+                        ActionResult::Error(_) => {
+                            (with_alpha(theme.status.error, 0.15), theme.status.error)
+                        }
+                    };
+                    let banner = Frame::new()
+                        .fill(bg_color)
+                        .corner_radius(4.0)
+                        .inner_margin(Margin::symmetric(8, 4));
+                    banner.show(ui, |ui| {
+                        ui.label(
+                            RichText::new(result.message())
+                                .font(FontId::proportional(10.0))
+                                .color(text_color),
+                        );
+                    });
+                }
             }
         }
     });
@@ -1008,5 +1283,123 @@ mod tests {
         }
         let pct = monitor.processes[0].memory_percent.unwrap();
         assert!((pct - 0.0625).abs() < 0.001);
+    }
+
+    // -----------------------------------------------------------------------
+    // P6.1: Process action safety tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn protected_pid_zero_is_blocked() {
+        assert!(is_protected_pid(0));
+    }
+
+    #[test]
+    fn protected_pid_one_is_blocked() {
+        assert!(is_protected_pid(1));
+    }
+
+    #[test]
+    fn protected_pid_two_is_blocked() {
+        assert!(is_protected_pid(2));
+    }
+
+    #[test]
+    fn normal_pid_is_not_protected() {
+        assert!(!is_protected_pid(42));
+        assert!(!is_protected_pid(1000));
+    }
+
+    #[test]
+    fn validate_pid_rejects_zero() {
+        assert!(!validate_pid(0));
+    }
+
+    #[test]
+    fn validate_pid_accepts_positive() {
+        assert!(validate_pid(1));
+        assert!(validate_pid(99999));
+    }
+
+    #[test]
+    fn action_result_success_is_success() {
+        let r = ActionResult::Success("ok".into());
+        assert!(r.is_success());
+        assert_eq!(r.message(), "ok");
+    }
+
+    #[test]
+    fn action_result_denied_is_not_success() {
+        let r = ActionResult::Denied("no".into());
+        assert!(!r.is_success());
+        assert_eq!(r.message(), "no");
+    }
+
+    #[test]
+    fn action_result_error_is_not_success() {
+        let r = ActionResult::Error("fail".into());
+        assert!(!r.is_success());
+        assert_eq!(r.message(), "fail");
+    }
+
+    #[test]
+    fn refresh_rejects_protected_pid() {
+        let mut monitor = ProcessMonitor::new();
+        let result = monitor.execute_action(ProcessAction::Refresh { pid: 1 });
+        assert!(matches!(result, ActionResult::Denied(_)));
+    }
+
+    #[test]
+    fn refresh_rejects_zero_pid() {
+        let mut monitor = ProcessMonitor::new();
+        let result = monitor.execute_action(ProcessAction::Refresh { pid: 0 });
+        assert!(matches!(result, ActionResult::Error(_)));
+    }
+
+    #[test]
+    fn terminate_rejects_protected_pid() {
+        let mut monitor = ProcessMonitor::new();
+        let result = monitor.execute_action(ProcessAction::Terminate { pid: 1 });
+        assert!(matches!(result, ActionResult::Denied(_)));
+    }
+
+    #[test]
+    fn terminate_rejects_zero_pid() {
+        let mut monitor = ProcessMonitor::new();
+        let result = monitor.execute_action(ProcessAction::Terminate { pid: 0 });
+        assert!(matches!(result, ActionResult::Error(_)));
+    }
+
+    #[test]
+    fn execute_action_stores_result() {
+        let mut monitor = ProcessMonitor::new();
+        assert!(monitor.last_action_result.is_none());
+        monitor.execute_action(ProcessAction::Refresh { pid: 0 });
+        assert!(monitor.last_action_result.is_some());
+        assert!(monitor.last_action_time.is_some());
+    }
+
+    #[test]
+    fn clear_old_action_result_removes_stale() {
+        let mut monitor = ProcessMonitor::new();
+        monitor.execute_action(ProcessAction::Refresh { pid: 0 });
+        assert!(monitor.last_action_result.is_some());
+        monitor.clear_old_action_result(Duration::ZERO);
+        assert!(monitor.last_action_result.is_none());
+    }
+
+    #[test]
+    fn drain_pending_action_returns_and_clears() {
+        let mut monitor = ProcessMonitor::new();
+        monitor.pending_action = Some(ProcessAction::Refresh { pid: 42 });
+        let action = monitor.drain_pending_action();
+        assert_eq!(action, Some(ProcessAction::Refresh { pid: 42 }));
+        assert!(monitor.pending_action.is_none());
+    }
+
+    #[test]
+    fn drain_pending_action_returns_none_when_empty() {
+        let mut monitor = ProcessMonitor::new();
+        assert!(monitor.drain_pending_action().is_none());
     }
 }

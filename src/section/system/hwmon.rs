@@ -714,52 +714,36 @@ mod tests {
             .devices
             .iter()
             .flat_map(|d| {
-                d.fans.iter().map(move |f| {
-                    (
-                        d.name.clone(),
-                        f.label.clone(),
-                        f.rpm,
-                    )
-                })
+                d.fans
+                    .iter()
+                    .map(move |f| (d.name.clone(), f.label.clone(), f.rpm))
             })
             .collect();
         m.cached_temps = m
             .devices
             .iter()
             .flat_map(|d| {
-                d.temps.iter().map(move |t| {
-                    (
-                        d.name.clone(),
-                        t.label.clone(),
-                        t.temp_celsius(),
-                    )
-                })
+                d.temps
+                    .iter()
+                    .map(move |t| (d.name.clone(), t.label.clone(), t.temp_celsius()))
             })
             .collect();
         m.cached_voltages = m
             .devices
             .iter()
             .flat_map(|d| {
-                d.voltages.iter().map(move |v| {
-                    (
-                        d.name.clone(),
-                        v.label.clone(),
-                        v.volts(),
-                    )
-                })
+                d.voltages
+                    .iter()
+                    .map(move |v| (d.name.clone(), v.label.clone(), v.volts()))
             })
             .collect();
         m.cached_currents = m
             .devices
             .iter()
             .flat_map(|d| {
-                d.currents.iter().map(move |c| {
-                    (
-                        d.name.clone(),
-                        c.label.clone(),
-                        c.amps(),
-                    )
-                })
+                d.currents
+                    .iter()
+                    .map(move |c| (d.name.clone(), c.label.clone(), c.amps()))
             })
             .collect();
     }

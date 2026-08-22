@@ -173,6 +173,13 @@ impl Section for SystemSection {
             self.last_collect = Some(now);
             ctx.request_repaint();
         }
+        // P6.1: Execute any pending process actions from the UI.
+        while let Some(action) = self.process_monitor.drain_pending_action() {
+            self.process_monitor.execute_action(action);
+        }
+        // P6.1: Auto-clear action result after 4 seconds.
+        self.process_monitor
+            .clear_old_action_result(Duration::from_secs(4));
     }
 
     fn render(&mut self, ui: &mut egui::Ui, context: &SectionContext<'_>) -> egui::Response {
