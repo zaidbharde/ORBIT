@@ -14,6 +14,12 @@
 //! - All actions validate PID existence, ownership, and protection status
 //! - Confirmation dialogs require explicit user approval before any signal
 //!
+//! P6.2 adds a non-executing command builder in the process detail panel:
+//! - Editable monospace text field showing the process command
+//! - Copy button to copy the command text to clipboard
+//! - Reset button to revert edits back to the original command
+//! - No shell execution, no Run/Execute button
+//!
 //! On non-Linux platforms the process list is always empty and the UI
 //! displays "Telemetry unavailable". Process actions are unsupported.
 
@@ -147,6 +153,55 @@ pub enum ConfirmKind {
 }
 
 // ---------------------------------------------------------------------------
+// P6.2: Command builder state
+// ---------------------------------------------------------------------------
+
+/// Non-executing command preview / builder state for the selected process.
+///
+/// The command text is displayed in an editable monospace field so users
+/// can inspect and copy it. No execution is ever performed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandBuilderState {
+    /// The currently displayed (possibly edited) command text.
+    pub command_text: String,
+    /// The original command text from `/proc/[pid]/cmdline` (for Reset).
+    pub original_command: String,
+    /// Which PID this state is tracking (to detect selection changes).
+    pub tracked_pid: Option<u32>,
+}
+
+impl CommandBuilderState {
+    pub fn new() -> Self {
+        Self {
+            command_text: String::new(),
+            original_command: String::new(),
+            tracked_pid: None,
+        }
+    }
+
+    /// Sync the command builder with a newly selected process.
+    /// If the PID changed, load the process's command text.
+    pub fn sync_with_process(&mut self, pid: u32, command: Option<&str>) {
+        if self.tracked_pid != Some(pid) {
+            self.tracked_pid = Some(pid);
+            let cmd = command.unwrap_or("").to_owned();
+            self.original_command = cmd.clone();
+            self.command_text = cmd;
+        }
+    }
+
+    /// Reset the command text to the original value.
+    pub fn reset(&mut self) {
+        self.command_text = self.original_command.clone();
+    }
+
+    /// Whether the command text differs from the original.
+    pub fn is_modified(&self) -> bool {
+        self.command_text != self.original_command
+    }
+}
+
+// ---------------------------------------------------------------------------
 // P6.1: Safety validation (testable pure functions)
 // ---------------------------------------------------------------------------
 
@@ -243,6 +298,8 @@ pub struct ProcessMonitor {
     pub last_action_time: Option<Instant>,
     /// Active confirmation dialog, if any.
     pub confirm_dialog: Option<ConfirmKind>,
+    /// P6.2: Non-executing command builder state for the selected process.
+    pub command_builder: CommandBuilderState,
 }
 
 impl ProcessMonitor {
@@ -267,6 +324,7 @@ impl ProcessMonitor {
             last_action_result: None,
             last_action_time: None,
             confirm_dialog: None,
+            command_builder: CommandBuilderState::new(),
         }
     }
 
@@ -1116,6 +1174,61 @@ pub fn show_process_card(ui: &mut Ui, context: &SectionContext<'_>, monitor: &mu
                         );
                     });
                 }
+
+                // P6.2: Command Builder section
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Command")
+                        .font(FontId::proportional(11.0))
+                        .color(theme.ui.secondary_text)
+                        .strong(),
+                );
+                monitor
+                    .command_builder
+                    .sync_with_process(proc_info.pid, proc_info.command.as_deref());
+
+                let _cmd_response = ui.add(
+                    egui::TextEdit::singleline(&mut monitor.command_builder.command_text)
+                        .font(FontId::monospace(10.0))
+                        .desired_width(ui.available_width())
+                        .code_editor(),
+                );
+
+                ui.horizontal(|ui| {
+                    // Copy button
+                    let copy_btn = egui::Button::new(
+                        RichText::new("Copy")
+                            .font(FontId::proportional(10.0))
+                            .color(theme.ui.text),
+                    )
+                    .fill(theme.ui.accent);
+                    if ui.add(copy_btn).clicked() {
+                        ui.ctx()
+                            .copy_text(monitor.command_builder.command_text.clone());
+                    }
+
+                    // Reset button (only enabled when modified)
+                    let is_modified = monitor.command_builder.is_modified();
+                    let reset_btn = egui::Button::new(
+                        RichText::new("Reset")
+                            .font(FontId::proportional(10.0))
+                            .color(if is_modified {
+                                theme.ui.text
+                            } else {
+                                theme.ui.secondary_text
+                            }),
+                    )
+                    .fill(if is_modified {
+                        theme.ui.tab_inactive
+                    } else {
+                        Color32::TRANSPARENT
+                    });
+                    if ui.add(reset_btn).clicked() && is_modified {
+                        monitor.command_builder.reset();
+                    }
+                });
             }
         }
     });
@@ -1763,5 +1876,85 @@ mod tests {
         let mut monitor = ProcessMonitor::new();
         let result = monitor.execute_action(ProcessAction::Kill { pid: 99999999 });
         assert!(matches!(result, ActionResult::Error(_)));
+    }
+
+    // -----------------------------------------------------------------------
+    // P6.2: Command builder tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn command_builder_starts_empty() {
+        let cb = CommandBuilderState::new();
+        assert!(cb.command_text.is_empty());
+        assert!(cb.original_command.is_empty());
+        assert!(cb.tracked_pid.is_none());
+    }
+
+    #[test]
+    fn command_builder_sync_loads_command() {
+        let mut cb = CommandBuilderState::new();
+        cb.sync_with_process(42, Some("/bin/bash -c echo hi"));
+        assert_eq!(cb.tracked_pid, Some(42));
+        assert_eq!(cb.command_text, "/bin/bash -c echo hi");
+        assert_eq!(cb.original_command, "/bin/bash -c echo hi");
+    }
+
+    #[test]
+    fn command_builder_sync_handles_none_command() {
+        let mut cb = CommandBuilderState::new();
+        cb.sync_with_process(1, None);
+        assert_eq!(cb.tracked_pid, Some(1));
+        assert!(cb.command_text.is_empty());
+        assert!(cb.original_command.is_empty());
+    }
+
+    #[test]
+    fn command_builder_does_not_reset_on_same_pid() {
+        let mut cb = CommandBuilderState::new();
+        cb.sync_with_process(42, Some("/bin/bash"));
+        cb.command_text = "/bin/bash -c edited".to_owned();
+        // Sync again with same PID — should NOT overwrite edits
+        cb.sync_with_process(42, Some("/bin/bash"));
+        assert_eq!(cb.command_text, "/bin/bash -c edited");
+    }
+
+    #[test]
+    fn command_builder_resets_on_new_pid() {
+        let mut cb = CommandBuilderState::new();
+        cb.sync_with_process(42, Some("/bin/bash"));
+        cb.command_text = "/bin/bash -c edited".to_owned();
+        // Sync with different PID — should load new command
+        cb.sync_with_process(99, Some("/usr/bin/vim"));
+        assert_eq!(cb.command_text, "/usr/bin/vim");
+        assert_eq!(cb.original_command, "/usr/bin/vim");
+    }
+
+    #[test]
+    fn command_builder_reset_restores_original() {
+        let mut cb = CommandBuilderState::new();
+        cb.sync_with_process(42, Some("/bin/bash"));
+        cb.command_text = "/bin/bash -c modified".to_owned();
+        assert!(cb.is_modified());
+        cb.reset();
+        assert_eq!(cb.command_text, "/bin/bash");
+        assert!(!cb.is_modified());
+    }
+
+    #[test]
+    fn command_builder_is_modified_detects_changes() {
+        let mut cb = CommandBuilderState::new();
+        cb.sync_with_process(42, Some("/bin/bash"));
+        assert!(!cb.is_modified());
+        cb.command_text = "changed".to_owned();
+        assert!(cb.is_modified());
+    }
+
+    #[test]
+    fn command_builder_equality() {
+        let mut a = CommandBuilderState::new();
+        a.sync_with_process(1, Some("cmd"));
+        let mut b = CommandBuilderState::new();
+        b.sync_with_process(1, Some("cmd"));
+        assert_eq!(a, b);
     }
 }
