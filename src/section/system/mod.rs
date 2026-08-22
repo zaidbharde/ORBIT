@@ -10,6 +10,7 @@ pub mod metrics;
 pub mod network;
 pub mod process;
 pub mod storage;
+pub mod thermal;
 
 use super::{Section, SectionContext, SectionId};
 use crate::theme::Theme;
@@ -22,6 +23,7 @@ use metrics::{
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use storage::DiskIoMonitor;
+use thermal::ThermalMonitor;
 
 /// How often dynamic metrics are re-read (1 Hz, well below the 60 fps frame
 /// rate, so the update loop stays lightweight).
@@ -38,6 +40,7 @@ pub struct SystemSection {
     disk_io: DiskIoMonitor,
     process_monitor: process::ProcessMonitor,
     network: network::NetworkMonitor,
+    thermal: ThermalMonitor,
     prev_cpu: Option<CpuTicks>,
     cpu_history: VecDeque<f32>,
     ram_history: VecDeque<f32>,
@@ -45,6 +48,7 @@ pub struct SystemSection {
     vram_history: VecDeque<f32>,
     read_history: VecDeque<f32>,
     write_history: VecDeque<f32>,
+    thermal_history: VecDeque<f32>,
     last_collect: Option<Instant>,
 }
 
@@ -57,6 +61,7 @@ impl SystemSection {
             disk_io: DiskIoMonitor::new(),
             process_monitor: process::ProcessMonitor::new(),
             network: network::NetworkMonitor::new(),
+            thermal: ThermalMonitor::new(),
             prev_cpu: None,
             cpu_history: VecDeque::with_capacity(HISTORY_LEN),
             ram_history: VecDeque::with_capacity(HISTORY_LEN),
@@ -64,6 +69,7 @@ impl SystemSection {
             vram_history: VecDeque::with_capacity(HISTORY_LEN),
             read_history: VecDeque::with_capacity(HISTORY_LEN),
             write_history: VecDeque::with_capacity(HISTORY_LEN),
+            thermal_history: VecDeque::with_capacity(HISTORY_LEN),
             last_collect: None,
         }
     }
@@ -126,6 +132,11 @@ impl SystemSection {
 
         self.network.poll();
 
+        self.thermal.poll();
+        if let Some(max_temp) = self.thermal.max_temp_celsius() {
+            push_history(&mut self.thermal_history, max_temp);
+        }
+
         self.metrics.uptime_secs = read_uptime_secs();
     }
 }
@@ -161,6 +172,7 @@ impl Section for SystemSection {
         let vram_history = self.vram_history.make_contiguous();
         let read_history = self.read_history.make_contiguous();
         let write_history = self.write_history.make_contiguous();
+        let thermal_history = self.thermal_history.make_contiguous();
         egui::ScrollArea::vertical()
             .id_salt("system-dashboard")
             .auto_shrink([false, false])
@@ -177,6 +189,8 @@ impl Section for SystemSection {
                     vram_history,
                     read_history,
                     write_history,
+                    &self.thermal,
+                    thermal_history,
                     &mut self.process_monitor,
                     &mut self.network,
                 );
@@ -218,5 +232,6 @@ mod tests {
         assert!(section.vram_history.len() <= HISTORY_LEN);
         assert!(section.read_history.len() <= HISTORY_LEN);
         assert!(section.write_history.len() <= HISTORY_LEN);
+        assert!(section.thermal_history.len() <= HISTORY_LEN);
     }
 }

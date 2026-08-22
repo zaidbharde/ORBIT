@@ -9,6 +9,7 @@ use super::HISTORY_LEN;
 use super::gpu::{GpuBackend, GpuInfo, GpuMonitor};
 use super::metrics::{SystemInfo, SystemMetrics};
 use super::storage::{DiskIoMetrics, StorageMount, THROUGHPUT_FLOOR_BPS};
+use super::thermal::{ThermalMonitor, ThermalZone};
 use crate::glass::with_alpha;
 use crate::section::SectionContext;
 use crate::theme::Theme;
@@ -30,6 +31,8 @@ pub fn show(
     vram_history: &[f32],
     read_history: &[f32],
     write_history: &[f32],
+    thermal: &ThermalMonitor,
+    thermal_history: &[f32],
     process_monitor: &mut super::process::ProcessMonitor,
     network_monitor: &mut super::network::NetworkMonitor,
 ) {
@@ -40,7 +43,7 @@ pub fn show(
     });
     ui.columns(2, |columns| {
         gpu_card(&mut columns[0], context, gpu, gpu_history, vram_history);
-        info_card(&mut columns[1], context, info, metrics);
+        thermal_card(&mut columns[1], context, thermal, thermal_history);
     });
     ui.columns(2, |columns| {
         storage_card(&mut columns[0], context, &metrics.storage_mounts);
@@ -52,6 +55,7 @@ pub fn show(
             write_history,
         );
     });
+    info_card(ui, context, info, metrics);
     super::network::show_network_card(ui, context, network_monitor);
     super::process::show_process_card(ui, context, process_monitor);
 }
@@ -409,6 +413,78 @@ fn compact_gpu_row(ui: &mut Ui, context: &SectionContext<'_>, index: usize, gpu:
             );
         }
     }
+}
+
+fn thermal_card(
+    ui: &mut Ui,
+    context: &SectionContext<'_>,
+    monitor: &ThermalMonitor,
+    thermal_history: &[f32],
+) {
+    let theme = context.theme;
+    card(ui, context, "Temperature", |ui| {
+        let zones = monitor.zones();
+        if zones.is_empty() {
+            ui.label(RichText::new("Telemetry unavailable").color(theme.ui.secondary_text));
+            return;
+        }
+        if let Some(max_temp) = monitor.max_temp_celsius() {
+            let color = temperature_color(theme, max_temp);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("{max_temp:.0}°C"))
+                        .font(FontId::monospace(22.0))
+                        .color(theme.ui.text),
+                );
+                ui.add_space(6.0);
+                ui.label(RichText::new("peak").color(theme.ui.secondary_text));
+            });
+            usage_bar(ui, context, (max_temp / 100.0).clamp(0.0, 1.0), color);
+            graph(ui, context, thermal_history, color);
+        }
+        for zone in zones {
+            ui.add_space(2.0);
+            thermal_zone_row(ui, context, zone);
+        }
+    });
+}
+
+fn thermal_zone_row(ui: &mut Ui, context: &SectionContext<'_>, zone: &ThermalZone) {
+    let theme = context.theme;
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            egui::vec2(120.0, 16.0),
+            egui::Label::new(
+                RichText::new(&zone.type_name)
+                    .font(FontId::proportional(11.0))
+                    .color(theme.ui.secondary_text),
+            ),
+        );
+        match zone.temp_celsius() {
+            Some(temp) => {
+                let color = temperature_color(theme, temp);
+                ui.label(
+                    RichText::new(format!("{temp:.0}°C"))
+                        .font(FontId::monospace(11.0))
+                        .color(color),
+                );
+            }
+            None => {
+                ui.label(
+                    RichText::new("Unavailable")
+                        .font(FontId::proportional(11.0))
+                        .color(theme.status.warning),
+                );
+            }
+        }
+        if let Some(crit) = zone.critical_temp_celsius() {
+            ui.label(
+                RichText::new(format!("crit {crit:.0}°C"))
+                    .font(FontId::monospace(9.0))
+                    .color(theme.ui.secondary_text),
+            );
+        }
+    });
 }
 
 fn stat_line(ui: &mut Ui, context: &SectionContext<'_>, label: &str, value: Option<String>) {
