@@ -763,7 +763,15 @@ fn detail_row(ui: &mut Ui, theme: &Theme, label: &str, value: Option<String>) {
 }
 
 fn truncate(s: &str, max_len: usize) -> &str {
-    if s.len() <= max_len { s } else { &s[..max_len] }
+    if s.len() <= max_len {
+        s
+    } else {
+        let mut end = max_len;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        &s[..end]
+    }
 }
 
 fn truncate_owned(s: String, max_len: usize) -> String {

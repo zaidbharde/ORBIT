@@ -754,7 +754,15 @@ fn detail_row(ui: &mut Ui, theme: &Theme, label: &str, value: Option<&str>) {
 }
 
 fn truncate_str(s: &str, max_len: usize) -> &str {
-    if s.len() <= max_len { s } else { &s[..max_len] }
+    if s.len() <= max_len {
+        s
+    } else {
+        let mut end = max_len;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        &s[..end]
+    }
 }
 
 /// Auto-scaling throughput graph (reused from dashboard.rs pattern).

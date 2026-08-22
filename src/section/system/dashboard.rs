@@ -7,7 +7,7 @@
 
 use super::HISTORY_LEN;
 use super::gpu::{GpuBackend, GpuInfo, GpuMonitor};
-use super::hwmon::{CurrentSensor, HwmonDevice, HwmonMonitor, TempSensor, VoltageSensor};
+use super::hwmon::HwmonMonitor;
 use super::metrics::{SystemInfo, SystemMetrics};
 use super::storage::{DiskIoMetrics, StorageMount, THROUGHPUT_FLOOR_BPS};
 use super::thermal::{ThermalMonitor, ThermalZone};
@@ -503,10 +503,10 @@ fn hardware_sensors_card(
 ) {
     let theme = context.theme;
     card(ui, context, "Hardware Sensors", |ui| {
-        let fans = monitor.all_fans();
-        let temps = monitor.all_temps();
-        let voltages = monitor.all_voltages();
-        let currents = monitor.all_currents();
+        let fans = monitor.fans();
+        let temps = monitor.temps();
+        let voltages = monitor.voltages();
+        let currents = monitor.currents();
 
         let has_any =
             !fans.is_empty() || !temps.is_empty() || !voltages.is_empty() || !currents.is_empty();
@@ -522,8 +522,16 @@ fn hardware_sensors_card(
                     .color(theme.ui.secondary_text)
                     .strong(),
             );
-            for (device, fan) in &fans {
-                fan_row(ui, context, device, fan);
+            for (device_name, label, rpm) in fans {
+                sensor_row(
+                    ui,
+                    context,
+                    label.as_deref(),
+                    *rpm,
+                    "RPM",
+                    device_name,
+                    false,
+                );
             }
             if monitor.primary_fan_rpm().is_some() {
                 fan_rpm_graph(ui, context, fan_history);
@@ -540,8 +548,8 @@ fn hardware_sensors_card(
                     .color(theme.ui.secondary_text)
                     .strong(),
             );
-            for (device, temp) in &temps {
-                hwmon_temp_row(ui, context, device, temp);
+            for (device_name, label, temp_c) in temps {
+                temp_row(ui, context, label.as_deref(), *temp_c, device_name);
             }
         }
 
@@ -555,8 +563,14 @@ fn hardware_sensors_card(
                     .color(theme.ui.secondary_text)
                     .strong(),
             );
-            for (device, voltage) in &voltages {
-                voltage_row(ui, context, device, voltage);
+            for (device_name, label, volts) in voltages {
+                unit_row(
+                    ui,
+                    context,
+                    label.as_deref(),
+                    volts.map(|v| format!("{v:.3} V")),
+                    device_name,
+                );
             }
         }
 
@@ -570,42 +584,57 @@ fn hardware_sensors_card(
                     .color(theme.ui.secondary_text)
                     .strong(),
             );
-            for (device, current) in &currents {
-                current_row(ui, context, device, current);
+            for (device_name, label, amps) in currents {
+                unit_row(
+                    ui,
+                    context,
+                    label.as_deref(),
+                    amps.map(|a| format!("{a:.3} A")),
+                    device_name,
+                );
             }
         }
     });
 }
 
-fn fan_row(
+fn sensor_row(
     ui: &mut Ui,
     context: &SectionContext<'_>,
-    device: &HwmonDevice,
-    fan: &super::hwmon::FanSensor,
+    label: Option<&str>,
+    value: Option<u32>,
+    unit: &str,
+    device_name: &str,
+    show_stopped: bool,
 ) {
     let theme = context.theme;
-    let fallback = format!("fan{}", fan.index);
+    let fallback;
+    let display_label = match label {
+        Some(l) => l,
+        None => {
+            fallback = format!("sensor");
+            &fallback
+        }
+    };
     ui.horizontal(|ui| {
-        let label = fan.label.as_deref().unwrap_or(&fallback);
         ui.add_sized(
             egui::vec2(120.0, 16.0),
             egui::Label::new(
-                RichText::new(label)
+                RichText::new(display_label)
                     .font(FontId::proportional(11.0))
                     .color(theme.ui.secondary_text),
             ),
         );
-        match fan.rpm {
-            Some(0) => {
+        match value {
+            Some(0) if !show_stopped => {
                 ui.label(
-                    RichText::new("0 RPM (stopped)")
+                    RichText::new("0 (stopped)")
                         .font(FontId::monospace(11.0))
                         .color(theme.ui.secondary_text),
                 );
             }
-            Some(rpm) => {
+            Some(v) => {
                 ui.label(
-                    RichText::new(format!("{rpm} RPM"))
+                    RichText::new(format!("{v} {unit}"))
                         .font(FontId::monospace(11.0))
                         .color(theme.ui.text),
                 );
@@ -619,7 +648,106 @@ fn fan_row(
             }
         }
         ui.label(
-            RichText::new(format!("({})", device.name))
+            RichText::new(format!("({device_name})"))
+                .font(FontId::proportional(9.0))
+                .color(theme.ui.secondary_text),
+        );
+    });
+}
+
+fn temp_row(
+    ui: &mut Ui,
+    context: &SectionContext<'_>,
+    label: Option<&str>,
+    temp_c: Option<f32>,
+    device_name: &str,
+) {
+    let theme = context.theme;
+    let fallback;
+    let display_label = match label {
+        Some(l) => l,
+        None => {
+            fallback = format!("sensor");
+            &fallback
+        }
+    };
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            egui::vec2(120.0, 16.0),
+            egui::Label::new(
+                RichText::new(display_label)
+                    .font(FontId::proportional(11.0))
+                    .color(theme.ui.secondary_text),
+            ),
+        );
+        match temp_c {
+            Some(celsius) => {
+                let color = temperature_color(theme, celsius);
+                ui.label(
+                    RichText::new(format!("{celsius:.0}°C"))
+                        .font(FontId::monospace(11.0))
+                        .color(color),
+                );
+            }
+            None => {
+                ui.label(
+                    RichText::new("Unavailable")
+                        .font(FontId::proportional(11.0))
+                        .color(theme.status.warning),
+                );
+            }
+        }
+        ui.label(
+            RichText::new(format!("({device_name})"))
+                .font(FontId::proportional(9.0))
+                .color(theme.ui.secondary_text),
+        );
+    });
+}
+
+fn unit_row(
+    ui: &mut Ui,
+    context: &SectionContext<'_>,
+    label: Option<&str>,
+    formatted: Option<String>,
+    device_name: &str,
+) {
+    let theme = context.theme;
+    let fallback;
+    let display_label = match label {
+        Some(l) => l,
+        None => {
+            fallback = format!("sensor");
+            &fallback
+        }
+    };
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            egui::vec2(120.0, 16.0),
+            egui::Label::new(
+                RichText::new(display_label)
+                    .font(FontId::proportional(11.0))
+                    .color(theme.ui.secondary_text),
+            ),
+        );
+        match formatted {
+            Some(text) => {
+                ui.label(
+                    RichText::new(text)
+                        .font(FontId::monospace(11.0))
+                        .color(theme.ui.text),
+                );
+            }
+            None => {
+                ui.label(
+                    RichText::new("Unavailable")
+                        .font(FontId::proportional(11.0))
+                        .color(theme.status.warning),
+                );
+            }
+        }
+        ui.label(
+            RichText::new(format!("({device_name})"))
                 .font(FontId::proportional(9.0))
                 .color(theme.ui.secondary_text),
         );
@@ -701,133 +829,6 @@ fn fan_rpm_graph(ui: &mut Ui, context: &SectionContext<'_>, fan_history: &[f32])
         FontId::proportional(9.0),
         theme.ui.secondary_text,
     );
-}
-
-fn hwmon_temp_row(
-    ui: &mut Ui,
-    context: &SectionContext<'_>,
-    device: &HwmonDevice,
-    temp: &TempSensor,
-) {
-    let theme = context.theme;
-    let fallback = format!("temp{}", temp.index);
-    ui.horizontal(|ui| {
-        let label = temp.label.as_deref().unwrap_or(&fallback);
-        ui.add_sized(
-            egui::vec2(120.0, 16.0),
-            egui::Label::new(
-                RichText::new(label)
-                    .font(FontId::proportional(11.0))
-                    .color(theme.ui.secondary_text),
-            ),
-        );
-        match temp.temp_celsius() {
-            Some(celsius) => {
-                let color = temperature_color(theme, celsius);
-                ui.label(
-                    RichText::new(format!("{celsius:.0}°C"))
-                        .font(FontId::monospace(11.0))
-                        .color(color),
-                );
-            }
-            None => {
-                ui.label(
-                    RichText::new("Unavailable")
-                        .font(FontId::proportional(11.0))
-                        .color(theme.status.warning),
-                );
-            }
-        }
-        ui.label(
-            RichText::new(format!("({})", device.name))
-                .font(FontId::proportional(9.0))
-                .color(theme.ui.secondary_text),
-        );
-    });
-}
-
-fn voltage_row(
-    ui: &mut Ui,
-    context: &SectionContext<'_>,
-    device: &HwmonDevice,
-    voltage: &VoltageSensor,
-) {
-    let theme = context.theme;
-    let fallback = format!("in{}", voltage.index);
-    ui.horizontal(|ui| {
-        let label = voltage.label.as_deref().unwrap_or(&fallback);
-        ui.add_sized(
-            egui::vec2(120.0, 16.0),
-            egui::Label::new(
-                RichText::new(label)
-                    .font(FontId::proportional(11.0))
-                    .color(theme.ui.secondary_text),
-            ),
-        );
-        match voltage.volts() {
-            Some(volts) => {
-                ui.label(
-                    RichText::new(format!("{volts:.3} V"))
-                        .font(FontId::monospace(11.0))
-                        .color(theme.ui.text),
-                );
-            }
-            None => {
-                ui.label(
-                    RichText::new("Unavailable")
-                        .font(FontId::proportional(11.0))
-                        .color(theme.status.warning),
-                );
-            }
-        }
-        ui.label(
-            RichText::new(format!("({})", device.name))
-                .font(FontId::proportional(9.0))
-                .color(theme.ui.secondary_text),
-        );
-    });
-}
-
-fn current_row(
-    ui: &mut Ui,
-    context: &SectionContext<'_>,
-    device: &HwmonDevice,
-    current: &CurrentSensor,
-) {
-    let theme = context.theme;
-    let fallback = format!("curr{}", current.index);
-    ui.horizontal(|ui| {
-        let label = current.label.as_deref().unwrap_or(&fallback);
-        ui.add_sized(
-            egui::vec2(120.0, 16.0),
-            egui::Label::new(
-                RichText::new(label)
-                    .font(FontId::proportional(11.0))
-                    .color(theme.ui.secondary_text),
-            ),
-        );
-        match current.amps() {
-            Some(amps) => {
-                ui.label(
-                    RichText::new(format!("{amps:.3} A"))
-                        .font(FontId::monospace(11.0))
-                        .color(theme.ui.text),
-                );
-            }
-            None => {
-                ui.label(
-                    RichText::new("Unavailable")
-                        .font(FontId::proportional(11.0))
-                        .color(theme.status.warning),
-                );
-            }
-        }
-        ui.label(
-            RichText::new(format!("({})", device.name))
-                .font(FontId::proportional(9.0))
-                .color(theme.ui.secondary_text),
-        );
-    });
 }
 
 fn stat_line_colored(

@@ -9,8 +9,6 @@
 //! On non-Linux platforms every reader returns an empty list so the
 //! project compiles. Unavailable data renders as "Unavailable".
 
-use std::collections::VecDeque;
-
 /// Sysfs base directory for hwmon devices.
 const HWMON_BASE: &str = "/sys/class/hwmon";
 
@@ -117,67 +115,94 @@ pub struct HwmonDevice {
 /// from the section's update loop.
 pub struct HwmonMonitor {
     devices: Vec<HwmonDevice>,
-    fan_history: VecDeque<f32>,
+    /// Cached flat fan list: (device_name, label, rpm).
+    cached_fans: Vec<(String, Option<String>, Option<u32>)>,
+    /// Cached flat temp list: (device_name, label, temp_celsius).
+    cached_temps: Vec<(String, Option<String>, Option<f32>)>,
+    /// Cached flat voltage list: (device_name, label, volts).
+    cached_voltages: Vec<(String, Option<String>, Option<f32>)>,
+    /// Cached flat current list: (device_name, label, amps).
+    cached_currents: Vec<(String, Option<String>, Option<f32>)>,
 }
 
 impl HwmonMonitor {
     pub fn new() -> Self {
         Self {
             devices: Vec::new(),
-            fan_history: VecDeque::with_capacity(60),
+            cached_fans: Vec::new(),
+            cached_temps: Vec::new(),
+            cached_voltages: Vec::new(),
+            cached_currents: Vec::new(),
         }
     }
 
     /// Polls all hwmon devices. Called once per second from the update loop.
     pub fn poll(&mut self) {
         self.devices = collect_hwmon_devices();
-        if let Some(rpm) = self.primary_fan_rpm() {
-            if self.fan_history.len() == 60 {
-                self.fan_history.pop_front();
-            }
-            self.fan_history.push_back(rpm as f32);
-        }
+        self.cached_fans = self
+            .devices
+            .iter()
+            .flat_map(|d| {
+                d.fans
+                    .iter()
+                    .map(move |f| (d.name.clone(), f.label.clone(), f.rpm))
+            })
+            .collect();
+        self.cached_temps = self
+            .devices
+            .iter()
+            .flat_map(|d| {
+                d.temps
+                    .iter()
+                    .map(move |t| (d.name.clone(), t.label.clone(), t.temp_celsius()))
+            })
+            .collect();
+        self.cached_voltages = self
+            .devices
+            .iter()
+            .flat_map(|d| {
+                d.voltages
+                    .iter()
+                    .map(move |v| (d.name.clone(), v.label.clone(), v.volts()))
+            })
+            .collect();
+        self.cached_currents = self
+            .devices
+            .iter()
+            .flat_map(|d| {
+                d.currents
+                    .iter()
+                    .map(move |c| (d.name.clone(), c.label.clone(), c.amps()))
+            })
+            .collect();
     }
 
-    /// All fan sensors across all devices.
-    pub fn all_fans(&self) -> Vec<(&HwmonDevice, &FanSensor)> {
-        self.devices
-            .iter()
-            .flat_map(|d| d.fans.iter().map(move |f| (d, f)))
-            .collect()
+    /// Cached fan data: (device_name, label, rpm). Zero-RPM fans included.
+    pub fn fans(&self) -> &[(String, Option<String>, Option<u32>)] {
+        &self.cached_fans
+    }
+
+    /// Cached temperature data: (device_name, label, temp_celsius).
+    pub fn temps(&self) -> &[(String, Option<String>, Option<f32>)] {
+        &self.cached_temps
+    }
+
+    /// Cached voltage data: (device_name, label, volts).
+    pub fn voltages(&self) -> &[(String, Option<String>, Option<f32>)] {
+        &self.cached_voltages
+    }
+
+    /// Cached current data: (device_name, label, amps).
+    pub fn currents(&self) -> &[(String, Option<String>, Option<f32>)] {
+        &self.cached_currents
     }
 
     /// RPM of the first available spinning fan, or `None`.
     pub fn primary_fan_rpm(&self) -> Option<u32> {
-        self.devices
+        self.cached_fans
             .iter()
-            .flat_map(|d| &d.fans)
-            .find(|f| f.rpm.map_or(false, |r| r > 0))
-            .and_then(|f| f.rpm)
-    }
-
-    /// All hwmon temperature sensors across all devices.
-    pub fn all_temps(&self) -> Vec<(&HwmonDevice, &TempSensor)> {
-        self.devices
-            .iter()
-            .flat_map(|d| d.temps.iter().map(move |t| (d, t)))
-            .collect()
-    }
-
-    /// All voltage sensors across all devices.
-    pub fn all_voltages(&self) -> Vec<(&HwmonDevice, &VoltageSensor)> {
-        self.devices
-            .iter()
-            .flat_map(|d| d.voltages.iter().map(move |v| (d, v)))
-            .collect()
-    }
-
-    /// All current sensors across all devices.
-    pub fn all_currents(&self) -> Vec<(&HwmonDevice, &CurrentSensor)> {
-        self.devices
-            .iter()
-            .flat_map(|d| d.currents.iter().map(move |c| (d, c)))
-            .collect()
+            .find(|(_, _, rpm)| rpm.map_or(false, |r| r > 0))
+            .and_then(|(_, _, rpm)| *rpm)
     }
 }
 
@@ -510,28 +535,25 @@ mod tests {
 
     #[test]
     fn primary_fan_rpm_selects_first_spinning() {
-        let monitor = HwmonMonitor {
-            devices: vec![HwmonDevice {
-                id: "hwmon4".into(),
-                name: "msi_wmi_platform".into(),
-                fans: vec![
-                    FanSensor {
-                        index: 1,
-                        label: None,
-                        rpm: Some(2341),
-                    },
-                    FanSensor {
-                        index: 2,
-                        label: None,
-                        rpm: Some(0),
-                    },
-                ],
-                temps: vec![],
-                voltages: vec![],
-                currents: vec![],
-            }],
-            fan_history: VecDeque::new(),
-        };
+        let monitor = make_test_monitor(vec![HwmonDevice {
+            id: "hwmon4".into(),
+            name: "msi_wmi_platform".into(),
+            fans: vec![
+                FanSensor {
+                    index: 1,
+                    label: None,
+                    rpm: Some(2341),
+                },
+                FanSensor {
+                    index: 2,
+                    label: None,
+                    rpm: Some(0),
+                },
+            ],
+            temps: vec![],
+            voltages: vec![],
+            currents: vec![],
+        }]);
         assert_eq!(monitor.primary_fan_rpm(), Some(2341));
     }
 
@@ -543,74 +565,202 @@ mod tests {
 
     #[test]
     fn primary_fan_rpm_none_when_all_zero() {
-        let monitor = HwmonMonitor {
-            devices: vec![HwmonDevice {
+        let monitor = make_test_monitor(vec![HwmonDevice {
+            id: "hwmon4".into(),
+            name: "msi_wmi_platform".into(),
+            fans: vec![FanSensor {
+                index: 1,
+                label: None,
+                rpm: Some(0),
+            }],
+            temps: vec![],
+            voltages: vec![],
+            currents: vec![],
+        }]);
+        assert_eq!(monitor.primary_fan_rpm(), None);
+    }
+
+    #[test]
+    fn cached_fans_collects_across_devices() {
+        let monitor = make_test_monitor(vec![
+            HwmonDevice {
                 id: "hwmon4".into(),
                 name: "msi_wmi_platform".into(),
                 fans: vec![FanSensor {
                     index: 1,
                     label: None,
-                    rpm: Some(0),
+                    rpm: Some(2341),
                 }],
                 temps: vec![],
                 voltages: vec![],
                 currents: vec![],
+            },
+            HwmonDevice {
+                id: "hwmon6".into(),
+                name: "coretemp".into(),
+                fans: vec![FanSensor {
+                    index: 1,
+                    label: Some("Processor".into()),
+                    rpm: Some(1200),
+                }],
+                temps: vec![],
+                voltages: vec![],
+                currents: vec![],
+            },
+        ]);
+        assert_eq!(monitor.fans().len(), 2);
+        assert_eq!(monitor.fans()[0].0, "msi_wmi_platform");
+        assert_eq!(monitor.fans()[1].0, "coretemp");
+    }
+
+    #[test]
+    fn cached_temps_populated_correctly() {
+        let monitor = make_test_monitor(vec![HwmonDevice {
+            id: "hwmon3".into(),
+            name: "nvme".into(),
+            fans: vec![],
+            temps: vec![TempSensor {
+                index: 1,
+                label: Some("Composite".into()),
+                temp_milli: Some(39_850),
             }],
-            fan_history: VecDeque::new(),
-        };
-        assert_eq!(monitor.primary_fan_rpm(), None);
+            voltages: vec![],
+            currents: vec![],
+        }]);
+        assert_eq!(monitor.temps().len(), 1);
+        assert_eq!(monitor.temps()[0].0, "nvme");
+        assert_eq!(monitor.temps()[0].1.as_deref(), Some("Composite"));
+        assert!((monitor.temps()[0].2.unwrap() - 39.85).abs() < 0.01);
     }
 
     #[test]
-    fn all_fans_collects_across_devices() {
-        let monitor = HwmonMonitor {
-            devices: vec![
-                HwmonDevice {
-                    id: "hwmon4".into(),
-                    name: "msi_wmi_platform".into(),
-                    fans: vec![FanSensor {
-                        index: 1,
-                        label: None,
-                        rpm: Some(2341),
-                    }],
-                    temps: vec![],
-                    voltages: vec![],
-                    currents: vec![],
-                },
-                HwmonDevice {
-                    id: "hwmon6".into(),
-                    name: "coretemp".into(),
-                    fans: vec![FanSensor {
-                        index: 1,
-                        label: Some("Processor".into()),
-                        rpm: Some(1200),
-                    }],
-                    temps: vec![],
-                    voltages: vec![],
-                    currents: vec![],
-                },
-            ],
-            fan_history: VecDeque::new(),
-        };
-        assert_eq!(monitor.all_fans().len(), 2);
+    fn cached_voltages_populated_correctly() {
+        let monitor = make_test_monitor(vec![HwmonDevice {
+            id: "hwmon2".into(),
+            name: "BAT1".into(),
+            fans: vec![],
+            temps: vec![],
+            voltages: vec![VoltageSensor {
+                index: 0,
+                label: None,
+                millivolt: Some(12803),
+            }],
+            currents: vec![],
+        }]);
+        assert_eq!(monitor.voltages().len(), 1);
+        assert!((monitor.voltages()[0].2.unwrap() - 12.803).abs() < 0.01);
     }
 
     #[test]
-    fn fan_history_is_capped_at_60() {
-        let mut monitor = HwmonMonitor::new();
-        for i in 0..70 {
-            monitor.fan_history.push_back(i as f32);
-            if monitor.fan_history.len() > 60 {
-                monitor.fan_history.pop_front();
-            }
-        }
-        assert_eq!(monitor.fan_history.len(), 60);
+    fn cached_currents_populated_correctly() {
+        let monitor = make_test_monitor(vec![HwmonDevice {
+            id: "hwmon2".into(),
+            name: "BAT1".into(),
+            fans: vec![],
+            temps: vec![],
+            voltages: vec![],
+            currents: vec![CurrentSensor {
+                index: 1,
+                label: None,
+                milliamp: Some(991),
+            }],
+        }]);
+        assert_eq!(monitor.currents().len(), 1);
+        assert!((monitor.currents()[0].2.unwrap() - 0.991).abs() < 0.001);
     }
 
     #[test]
     fn hwmon_monitor_starts_empty() {
         let monitor = HwmonMonitor::new();
         assert!(monitor.devices.is_empty());
-        assert!(monitor.fan_history.is_empty());
+        assert!(monitor.fans().is_empty());
+        assert!(monitor.temps().is_empty());
+    }
+
+    #[test]
+    fn primary_fan_rpm_from_cached_data() {
+        let monitor = make_test_monitor(vec![HwmonDevice {
+            id: "hwmon4".into(),
+            name: "msi_wmi_platform".into(),
+            fans: vec![
+                FanSensor {
+                    index: 1,
+                    label: None,
+                    rpm: Some(0),
+                },
+                FanSensor {
+                    index: 2,
+                    label: None,
+                    rpm: Some(1800),
+                },
+            ],
+            temps: vec![],
+            voltages: vec![],
+            currents: vec![],
+        }]);
+        assert_eq!(monitor.primary_fan_rpm(), Some(1800));
+    }
+
+    /// Helper to build a HwmonMonitor from devices for testing.
+    fn make_test_monitor(devices: Vec<HwmonDevice>) -> HwmonMonitor {
+        let mut monitor = HwmonMonitor::new();
+        monitor.devices = devices;
+        rebuild_caches(&mut monitor);
+        monitor
+    }
+
+    fn rebuild_caches(m: &mut HwmonMonitor) {
+        m.cached_fans = m
+            .devices
+            .iter()
+            .flat_map(|d| {
+                d.fans.iter().map(move |f| {
+                    (
+                        d.name.clone(),
+                        f.label.clone(),
+                        f.rpm,
+                    )
+                })
+            })
+            .collect();
+        m.cached_temps = m
+            .devices
+            .iter()
+            .flat_map(|d| {
+                d.temps.iter().map(move |t| {
+                    (
+                        d.name.clone(),
+                        t.label.clone(),
+                        t.temp_celsius(),
+                    )
+                })
+            })
+            .collect();
+        m.cached_voltages = m
+            .devices
+            .iter()
+            .flat_map(|d| {
+                d.voltages.iter().map(move |v| {
+                    (
+                        d.name.clone(),
+                        v.label.clone(),
+                        v.volts(),
+                    )
+                })
+            })
+            .collect();
+        m.cached_currents = m
+            .devices
+            .iter()
+            .flat_map(|d| {
+                d.currents.iter().map(move |c| {
+                    (
+                        d.name.clone(),
+                        c.label.clone(),
+                        c.amps(),
+                    )
+                })
+            })
+            .collect();
     }
 }

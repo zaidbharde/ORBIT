@@ -144,9 +144,8 @@ impl SystemSection {
         }
 
         self.hwmon.poll();
-        if let Some(rpm) = self.hwmon.primary_fan_rpm() {
-            push_history(&mut self.fan_history, rpm as f32);
-        }
+        let fan_rpm = self.hwmon.primary_fan_rpm().unwrap_or(0);
+        push_history(&mut self.fan_history, fan_rpm as f32);
 
         self.metrics.uptime_secs = read_uptime_secs();
     }
