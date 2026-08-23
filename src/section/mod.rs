@@ -1,3 +1,4 @@
+pub mod networking;
 pub mod placeholder;
 pub mod registry;
 pub mod system;

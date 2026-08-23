@@ -1,3 +1,4 @@
+use super::networking::NetworkingSection;
 use super::placeholder::PlaceholderSection;
 use super::system::SystemSection;
 use super::terminal_section::TerminalSection;
@@ -32,12 +33,9 @@ impl SectionRegistry {
     ) -> Self {
         let mut sections: Vec<Box<dyn Section>> = Vec::new();
         sections.push(build_terminal(config));
-        for id in [
-            SectionId::Coding,
-            SectionId::Networking,
-            SectionId::Cybersecurity,
-            SectionId::DevOps,
-        ] {
+        sections.push(Box::new(PlaceholderSection::new(SectionId::Coding)));
+        sections.push(Box::new(NetworkingSection::new()));
+        for id in [SectionId::Cybersecurity, SectionId::DevOps] {
             sections.push(Box::new(PlaceholderSection::new(id)));
         }
         sections.push(Box::new(SystemSection::new()));
