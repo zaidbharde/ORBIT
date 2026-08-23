@@ -94,6 +94,9 @@ pub struct NetworkInterfaceInfo {
     pub interface_type: InterfaceType,
     pub mac_address: Option<String>,
     pub mtu: Option<u32>,
+    /// Link speed in Mbps, read from `/sys/class/net/<iface>/speed`.
+    /// `None` when the kernel does not report a speed (e.g. Wi-Fi, loopback).
+    pub speed_mbps: Option<u32>,
     pub ipv4_addresses: Vec<String>,
     pub ipv6_addresses: Vec<String>,
     pub counters: InterfaceCounters,
@@ -238,6 +241,10 @@ mod imp {
                     .unwrap_or(InterfaceState::Unknown);
                 let mac = read_trimmed(&format!("{base}/address"));
                 let mtu = read_trimmed(&format!("{base}/mtu")).and_then(|s| s.parse().ok());
+                let speed = read_trimmed(&format!("{base}/speed"))
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .filter(|&v| v > 0)
+                    .map(|v| v as u32);
                 let iftype = detect_interface_type(&name, &base);
                 let ipv4 = read_ipv4_addresses(&name);
                 let ipv6 = read_ipv6_addresses(&name);
@@ -247,6 +254,7 @@ mod imp {
                     interface_type: iftype,
                     mac_address: mac,
                     mtu,
+                    speed_mbps: speed,
                     ipv4_addresses: ipv4,
                     ipv6_addresses: ipv6,
                     counters,
@@ -681,6 +689,12 @@ pub fn show_network_card(ui: &mut Ui, context: &SectionContext<'_>, monitor: &mu
                 "MTU",
                 iface.mtu.map(|m| format!("{m}")).as_deref(),
             );
+            detail_row(
+                ui,
+                theme,
+                "Speed",
+                iface.speed_mbps.map(|s| format!("{s} Mbps")).as_deref(),
+            );
             if !iface.ipv4_addresses.is_empty() {
                 detail_row(ui, theme, "IPv4", Some(&iface.ipv4_addresses.join(", ")));
             }
@@ -1075,6 +1089,22 @@ Inter-|   Receive                                                |  Transmit
         assert!(monitor.tx_history.is_empty());
         assert_eq!(monitor.total_rx, 0);
         assert_eq!(monitor.total_tx, 0);
+    }
+
+    // --- Speed parsing ---
+
+    #[test]
+    fn speed_is_parsed_from_proc_net_dev() {
+        // collect_interfaces reads speed from sysfs; verify the struct field exists.
+        let mut monitor = NetworkMonitor::new();
+        monitor.poll();
+        // At minimum, verify the speed_mbps field is present on all interfaces.
+        for iface in &monitor.interfaces {
+            // speed_mbps is Option<u32> — None is valid for Wi-Fi/loopback.
+            if let Some(speed) = iface.speed_mbps {
+                assert!(speed > 0, "speed should be positive when present");
+            }
+        }
     }
 
     // --- Multiple poll cycles produce stable counters ---

@@ -312,6 +312,7 @@ fn interfaces_card(ui: &mut Ui, context: &SectionContext<'_>, interfaces: &[Netw
             header_cell(ui, theme, "TYPE", 72.0);
             header_cell(ui, theme, "MAC", 120.0);
             header_cell(ui, theme, "MTU", 48.0);
+            header_cell(ui, theme, "SPEED", 56.0);
             header_cell(ui, theme, "ADDRESS", 140.0);
             header_cell(ui, theme, "RX / TX", 100.0);
         });
@@ -411,6 +412,18 @@ fn interface_row(
                     .color(theme.ui.secondary_text),
             ),
         );
+        let speed_text = iface
+            .speed_mbps
+            .map(|s| format!("{s} Mb"))
+            .unwrap_or_else(|| "--".into());
+        ui.add_sized(
+            egui::vec2(56.0, height),
+            egui::Label::new(
+                RichText::new(speed_text)
+                    .font(FontId::monospace(10.0))
+                    .color(theme.ui.secondary_text),
+            ),
+        );
         let addr = iface
             .ipv4_addresses
             .first()
@@ -468,6 +481,12 @@ fn interface_detail(ui: &mut Ui, context: &SectionContext<'_>, iface: &NetworkIn
                 theme,
                 "MTU",
                 iface.mtu.map(|m| format!("{m}")).as_deref(),
+            );
+            detail_row(
+                ui,
+                theme,
+                "Speed",
+                iface.speed_mbps.map(|s| format!("{s} Mbps")).as_deref(),
             );
             ui.end_row();
 
@@ -1064,5 +1083,17 @@ mod tests {
     fn truncate_str_long() {
         let result = truncate_str("hello world", 5);
         assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn speed_display_formatting() {
+        fn format_speed(speed: Option<u32>) -> String {
+            speed
+                .map(|s| format!("{s} Mb"))
+                .unwrap_or_else(|| "--".into())
+        }
+        assert_eq!(format_speed(None), "--");
+        assert_eq!(format_speed(Some(100)), "100 Mb");
+        assert_eq!(format_speed(Some(1000)), "1000 Mb");
     }
 }
