@@ -6,6 +6,9 @@
 
 use crate::glass::with_alpha;
 use crate::section::SectionContext;
+use crate::section::networking::connections::{
+    ConnectionFilter, ConnectionSnapshot, filter_connections,
+};
 use crate::section::system::network::{
     InterfaceState, InterfaceType, NetworkInterfaceInfo, THROUGHPUT_FLOOR_BPS,
 };
@@ -16,6 +19,9 @@ use eframe::egui::{
     Align2, Color32, FontId, Frame, Grid, Margin, Pos2, RichText, Shape, Stroke, Ui,
 };
 use std::collections::VecDeque;
+
+/// Maximum number of connection rows to render to avoid layout blowup.
+const MAX_RENDERED_ROWS: usize = 200;
 
 /// Render the full Networking dashboard.
 pub fn show(
@@ -28,6 +34,7 @@ pub fn show(
     total_tx: u64,
     rx_history: &VecDeque<f32>,
     tx_history: &VecDeque<f32>,
+    conn_snapshot: &ConnectionSnapshot,
 ) {
     let theme = context.theme;
     ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
@@ -59,6 +66,8 @@ pub fn show(
     });
 
     interfaces_card(ui, context, interfaces);
+
+    connections_card(ui, context, conn_snapshot);
 }
 
 /// Compact summary row at the top.
@@ -585,6 +594,282 @@ fn counter_row(ui: &mut Ui, theme: &Theme, label: &str, value: Option<String>) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Connections card
+// ---------------------------------------------------------------------------
+
+/// Card showing the local connections/socket table with filters and search.
+fn connections_card(ui: &mut Ui, context: &SectionContext<'_>, snapshot: &ConnectionSnapshot) {
+    let theme = context.theme;
+    let appearance = context.appearance;
+    let frame = Frame::new()
+        .fill(context.panel_fill)
+        .inner_margin(Margin::symmetric(12, 10))
+        .corner_radius(appearance.panel_radius.clamp(0.0, 16.0))
+        .stroke(if appearance.border_width > 0.0 {
+            Stroke::new(
+                appearance.border_width.clamp(0.0, 4.0),
+                with_alpha(theme.ui.border, appearance.border_opacity),
+            )
+        } else {
+            Stroke::NONE
+        });
+
+    frame.show(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = 4.0;
+        ui.label(
+            RichText::new("Connections")
+                .font(FontId::proportional(12.0))
+                .color(theme.ui.secondary_text)
+                .strong(),
+        );
+        ui.add_space(2.0);
+
+        if !snapshot.available {
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    RichText::new("Connection data unavailable")
+                        .font(FontId::proportional(11.0))
+                        .color(theme.ui.secondary_text),
+                );
+            });
+            return;
+        }
+
+        // Summary row.
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("Total: {}", snapshot.connections.len()))
+                    .font(FontId::monospace(11.0))
+                    .color(theme.ui.text),
+            );
+            ui.separator();
+            ui.label(
+                RichText::new(format!("TCP: {}", snapshot.tcp_count))
+                    .font(FontId::monospace(11.0))
+                    .color(theme.ui.text),
+            );
+            ui.separator();
+            ui.label(
+                RichText::new(format!("UDP: {}", snapshot.udp_count))
+                    .font(FontId::monospace(11.0))
+                    .color(theme.ui.text),
+            );
+            ui.separator();
+            summary_item_colored(
+                ui,
+                theme,
+                "LISTEN",
+                &snapshot.listen_count.to_string(),
+                theme.ui.accent,
+            );
+            ui.separator();
+            summary_item_colored(
+                ui,
+                theme,
+                "ESTABLISHED",
+                &snapshot.established_count.to_string(),
+                theme.status.success,
+            );
+        });
+
+        ui.add_space(4.0);
+
+        // Filter buttons.
+        let mem_id = ui.id().with("conn-filter-state");
+        let search_id = ui.id().with("conn-search-text");
+
+        let active_filter = ui.memory_mut(|m| m.data.get_persisted::<usize>(mem_id).unwrap_or(0));
+
+        let mut new_filter = active_filter;
+        ui.horizontal(|ui| {
+            for (idx, f) in ConnectionFilter::ALL.iter().enumerate() {
+                let is_active = idx == active_filter;
+                let label = RichText::new(f.label())
+                    .font(FontId::monospace(10.0))
+                    .color(if is_active {
+                        theme.ui.text
+                    } else {
+                        theme.ui.secondary_text
+                    });
+                let btn = egui::Button::new(label).frame(is_active);
+                if ui.add(btn).clicked() {
+                    new_filter = idx;
+                }
+            }
+        });
+
+        if new_filter != active_filter {
+            ui.memory_mut(|m| m.data.insert_persisted(mem_id, new_filter));
+        }
+
+        let filter = ConnectionFilter::ALL[new_filter];
+
+        // Search box.
+        let mut search_text: String = ui
+            .memory_mut(|m| m.data.get_persisted::<String>(search_id))
+            .unwrap_or_default();
+
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Search:")
+                    .font(FontId::proportional(10.0))
+                    .color(theme.ui.secondary_text),
+            );
+            let response = ui.add_sized(
+                egui::vec2(200.0, 18.0),
+                egui::TextEdit::singleline(&mut search_text)
+                    .hint_text("address, port, protocol, state...")
+                    .font(FontId::monospace(10.0)),
+            );
+            if response.changed() {
+                ui.memory_mut(|m| m.data.insert_persisted(search_id, search_text.clone()));
+            }
+        });
+
+        ui.add_space(4.0);
+
+        // Filter connections.
+        let indices = filter_connections(snapshot, filter, &search_text);
+
+        if indices.is_empty() {
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    RichText::new("No connections match the current filter")
+                        .font(FontId::proportional(11.0))
+                        .color(theme.ui.secondary_text),
+                );
+            });
+            return;
+        }
+
+        // Table header.
+        ui.horizontal(|ui| {
+            conn_header_cell(ui, theme, "PROTO", 52.0);
+            conn_header_cell(ui, theme, "LOCAL ADDR", 140.0);
+            conn_header_cell(ui, theme, "PORT", 56.0);
+            conn_header_cell(ui, theme, "REMOTE ADDR", 140.0);
+            conn_header_cell(ui, theme, "PORT", 56.0);
+            conn_header_cell(ui, theme, "STATE", 80.0);
+        });
+        ui.separator();
+
+        let row_height = 16.0;
+        let render_count = indices.len().min(MAX_RENDERED_ROWS);
+        let max_rows = 15;
+        let visible_rows = render_count.min(max_rows);
+
+        egui::ScrollArea::vertical()
+            .id_salt("networking-connections-list")
+            .max_height(row_height * visible_rows as f32 + 4.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for &idx in indices.iter().take(render_count) {
+                    conn_row(ui, context, &snapshot.connections[idx], row_height);
+                }
+            });
+
+        if indices.len() > MAX_RENDERED_ROWS {
+            ui.label(
+                RichText::new(format!(
+                    "Showing {MAX_RENDERED_ROWS} of {} connections",
+                    indices.len()
+                ))
+                .font(FontId::proportional(9.0))
+                .color(theme.ui.secondary_text),
+            );
+        }
+    });
+}
+
+fn conn_header_cell(ui: &mut Ui, theme: &Theme, label: &str, width: f32) {
+    ui.add_sized(
+        egui::vec2(width, 14.0),
+        egui::Label::new(
+            RichText::new(label)
+                .font(FontId::monospace(9.0))
+                .color(theme.ui.secondary_text)
+                .strong(),
+        ),
+    );
+}
+
+fn conn_row(
+    ui: &mut Ui,
+    context: &SectionContext<'_>,
+    conn: &crate::section::networking::connections::Connection,
+    height: f32,
+) {
+    use crate::section::networking::connections::{ConnectionState, Protocol};
+
+    let theme = context.theme;
+    let state_color = match conn.state {
+        ConnectionState::Listen => theme.ui.accent,
+        ConnectionState::Established => theme.status.success,
+        ConnectionState::TimeWait => theme.ui.secondary_text,
+        ConnectionState::CloseWait => theme.status.warning,
+        _ => theme.ui.text,
+    };
+
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            egui::vec2(52.0, height),
+            egui::Label::new(
+                RichText::new(conn.protocol.label())
+                    .font(FontId::monospace(10.0))
+                    .color(match conn.protocol {
+                        Protocol::Tcp => theme.ui.accent,
+                        Protocol::Udp => theme.status.warning,
+                    }),
+            ),
+        );
+        ui.add_sized(
+            egui::vec2(140.0, height),
+            egui::Label::new(
+                RichText::new(truncate_str(&conn.local_addr, 18))
+                    .font(FontId::monospace(10.0))
+                    .color(theme.ui.text),
+            ),
+        );
+        ui.add_sized(
+            egui::vec2(56.0, height),
+            egui::Label::new(
+                RichText::new(conn.local_port.to_string())
+                    .font(FontId::monospace(10.0))
+                    .color(theme.ui.text),
+            ),
+        );
+        ui.add_sized(
+            egui::vec2(140.0, height),
+            egui::Label::new(
+                RichText::new(truncate_str(&conn.remote_addr, 18))
+                    .font(FontId::monospace(10.0))
+                    .color(theme.ui.secondary_text),
+            ),
+        );
+        ui.add_sized(
+            egui::vec2(56.0, height),
+            egui::Label::new(
+                RichText::new(conn.remote_port.to_string())
+                    .font(FontId::monospace(10.0))
+                    .color(theme.ui.secondary_text),
+            ),
+        );
+        ui.add_sized(
+            egui::vec2(80.0, height),
+            egui::Label::new(
+                RichText::new(conn.state.label())
+                    .font(FontId::monospace(9.0))
+                    .color(state_color),
+            ),
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Formatting helpers
+// ---------------------------------------------------------------------------
+
 fn truncate_str(s: &str, max_len: usize) -> &str {
     if s.len() <= max_len {
         s
@@ -596,10 +881,6 @@ fn truncate_str(s: &str, max_len: usize) -> &str {
         &s[..end]
     }
 }
-
-// ---------------------------------------------------------------------------
-// Formatting helpers
-// ---------------------------------------------------------------------------
 
 /// Formats bytes per second as a human-readable throughput string.
 pub fn format_throughput(bytes_per_sec: f32) -> String {

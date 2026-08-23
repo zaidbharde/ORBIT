@@ -1,9 +1,14 @@
-//! Networking section: dedicated network interface monitoring.
+//! Networking section: dedicated network interface monitoring and connection
+//! monitoring.
 //!
 //! Reuses the [`NetworkMonitor`] from the System section's network module
 //! for data collection, but owns its own instance so the Networking section
 //! is fully independent. Collects at ~1 Hz; rendering reads cached values.
+//!
+//! P7.2 adds a read-only local socket monitor that reads `/proc/net/tcp[6]`
+//! and `/proc/net/udp[6]` to display active connections.
 
+pub mod connections;
 pub mod dashboard;
 
 use super::{Section, SectionContext, SectionId};
@@ -18,6 +23,7 @@ const COLLECT_INTERVAL: Duration = Duration::from_secs(1);
 /// The live Networking dashboard section.
 pub struct NetworkingSection {
     monitor: NetworkMonitor,
+    connection_snapshot: connections::ConnectionSnapshot,
     last_collect: Option<Instant>,
 }
 
@@ -25,6 +31,7 @@ impl NetworkingSection {
     pub fn new() -> Self {
         Self {
             monitor: NetworkMonitor::new(),
+            connection_snapshot: connections::ConnectionSnapshot::default(),
             last_collect: None,
         }
     }
@@ -42,6 +49,7 @@ impl Section for NetworkingSection {
             .map_or(true, |last| now.duration_since(last) >= COLLECT_INTERVAL);
         if due {
             self.monitor.poll();
+            self.connection_snapshot = connections::ConnectionSnapshot::collect();
             self.last_collect = Some(now);
             ctx.request_repaint();
         }
@@ -55,6 +63,7 @@ impl Section for NetworkingSection {
         let total_tx = self.monitor.total_tx;
         let rx_history = self.monitor.rx_history.clone();
         let tx_history = self.monitor.tx_history.clone();
+        let conn_snapshot = self.connection_snapshot.clone();
 
         egui::ScrollArea::vertical()
             .id_salt("networking-section")
@@ -70,6 +79,7 @@ impl Section for NetworkingSection {
                     total_tx,
                     &rx_history,
                     &tx_history,
+                    &conn_snapshot,
                 );
                 ui.response()
             })
@@ -114,5 +124,13 @@ mod tests {
         assert!(section.monitor.interfaces().is_empty());
         assert_eq!(section.monitor.total_rx, 0);
         assert_eq!(section.monitor.total_tx, 0);
+    }
+
+    #[test]
+    fn connection_snapshot_starts_empty() {
+        let section = NetworkingSection::new();
+        assert_eq!(section.connection_snapshot.connections.len(), 0);
+        assert_eq!(section.connection_snapshot.tcp_count, 0);
+        assert_eq!(section.connection_snapshot.udp_count, 0);
     }
 }
