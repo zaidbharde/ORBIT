@@ -1,3 +1,4 @@
+use super::cybersecurity::CybersecuritySection;
 use super::networking::NetworkingSection;
 use super::placeholder::PlaceholderSection;
 use super::system::SystemSection;
@@ -35,9 +36,8 @@ impl SectionRegistry {
         sections.push(build_terminal(config));
         sections.push(Box::new(PlaceholderSection::new(SectionId::Coding)));
         sections.push(Box::new(NetworkingSection::new()));
-        for id in [SectionId::Cybersecurity, SectionId::DevOps] {
-            sections.push(Box::new(PlaceholderSection::new(id)));
-        }
+        sections.push(Box::new(CybersecuritySection::new()));
+        sections.push(Box::new(PlaceholderSection::new(SectionId::DevOps)));
         sections.push(Box::new(SystemSection::new()));
 
         let active = SectionId::from_config_id(&config.active_section)
