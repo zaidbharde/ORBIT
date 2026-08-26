@@ -1,11 +1,12 @@
-//! Cybersecurity section: read-only local security posture overview
-//! and security event monitoring.
+//! Cybersecurity section: read-only local security posture overview,
+//! security event monitoring, and hardening audit.
 //!
 //! Collects security-relevant information from Linux procfs, sysfs and
 //! safe local files once per ~1 Hz cycle. Rendering reads cached values only.
 //! All operations are strictly read-only — no modifications are made.
 
 pub mod dashboard;
+pub mod hardening_audit;
 pub mod security_data;
 pub mod security_events;
 
@@ -21,6 +22,7 @@ const COLLECT_INTERVAL: Duration = Duration::from_secs(1);
 pub struct CybersecuritySection {
     snapshot: security_data::SecuritySnapshot,
     event_log: security_events::EventLog,
+    hardening_audit: hardening_audit::HardeningAudit,
     last_collect: Option<Instant>,
 }
 
@@ -29,6 +31,7 @@ impl CybersecuritySection {
         Self {
             snapshot: security_data::SecuritySnapshot::default(),
             event_log: security_events::EventLog::default(),
+            hardening_audit: hardening_audit::HardeningAudit::default(),
             last_collect: None,
         }
     }
@@ -36,6 +39,7 @@ impl CybersecuritySection {
     fn collect(&mut self) {
         self.snapshot = security_data::SecuritySnapshot::collect();
         self.event_log = security_events::collect_events(&self.event_log);
+        self.hardening_audit = hardening_audit::collect_audit();
     }
 }
 
@@ -59,11 +63,12 @@ impl Section for CybersecuritySection {
     fn render(&mut self, ui: &mut egui::Ui, context: &SectionContext<'_>) -> egui::Response {
         let snapshot = self.snapshot.clone();
         let event_log = self.event_log.clone();
+        let hardening_audit = self.hardening_audit.clone();
         egui::ScrollArea::vertical()
             .id_salt("cybersecurity-dashboard")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                dashboard::show(ui, context, &snapshot, &event_log);
+                dashboard::show(ui, context, &snapshot, &event_log, &hardening_audit);
                 ui.response()
             })
             .inner
@@ -72,11 +77,17 @@ impl Section for CybersecuritySection {
     fn status_label(&self, theme: &Theme) -> Option<(String, egui::Color32)> {
         let warnings = self.snapshot.summary.warnings;
         let events = self.event_log.len();
-        if warnings > 0 {
+        let audit_fails = self.hardening_audit.summary.fail;
+        let audit_warns = self.hardening_audit.summary.warning;
+
+        if warnings > 0 || audit_fails > 0 {
             Some((
                 format!(
-                    "{warnings} warning{} · {events} event{}",
-                    if warnings == 1 { "" } else { "s" },
+                    "{} warning{} · {} fail{} · {events} event{}",
+                    warnings + audit_warns,
+                    if warnings + audit_warns == 1 { "" } else { "s" },
+                    audit_fails,
+                    if audit_fails == 1 { "" } else { "s" },
                     if events == 1 { "" } else { "s" }
                 ),
                 theme.status.warning,
@@ -109,6 +120,7 @@ mod tests {
         assert_eq!(section.snapshot.summary.checks_available, 0);
         assert!(section.snapshot.last_updated.is_none());
         assert!(section.event_log.is_empty());
+        assert!(section.hardening_audit.is_empty());
     }
 
     #[test]
