@@ -35,6 +35,7 @@ pub fn show(
     rx_history: &VecDeque<f32>,
     tx_history: &VecDeque<f32>,
     conn_snapshot: &ConnectionSnapshot,
+    net_config: &super::net_config::NetworkConfigSnapshot,
 ) {
     let theme = context.theme;
     ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
@@ -68,6 +69,8 @@ pub fn show(
     interfaces_card(ui, context, interfaces);
 
     connections_card(ui, context, conn_snapshot);
+
+    network_config_card(ui, context, net_config);
 }
 
 /// Compact summary row at the top.
@@ -1044,6 +1047,446 @@ fn connection_detail(
             }
             ui.end_row();
         });
+}
+
+// ---------------------------------------------------------------------------
+// Network Configuration card (P7.5)
+// ---------------------------------------------------------------------------
+
+/// Card showing DNS, routing, and interface configuration.
+fn network_config_card(
+    ui: &mut Ui,
+    context: &SectionContext<'_>,
+    net_config: &super::net_config::NetworkConfigSnapshot,
+) {
+    let theme = context.theme;
+    let appearance = context.appearance;
+    let frame = Frame::new()
+        .fill(context.panel_fill)
+        .inner_margin(Margin::symmetric(12, 10))
+        .corner_radius(appearance.panel_radius.clamp(0.0, 16.0))
+        .stroke(if appearance.border_width > 0.0 {
+            Stroke::new(
+                appearance.border_width.clamp(0.0, 4.0),
+                with_alpha(theme.ui.border, appearance.border_opacity),
+            )
+        } else {
+            Stroke::NONE
+        });
+
+    frame.show(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = 4.0;
+        ui.label(
+            RichText::new("Network Configuration")
+                .font(FontId::proportional(12.0))
+                .color(theme.ui.secondary_text)
+                .strong(),
+        );
+        ui.add_space(2.0);
+
+        if !net_config.available {
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    RichText::new("Network configuration unavailable")
+                        .font(FontId::proportional(11.0))
+                        .color(theme.ui.secondary_text),
+                );
+            });
+            return;
+        }
+
+        // --- DNS Section ---
+        dns_section(ui, context, &net_config.dns);
+
+        ui.add_space(4.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        // --- Routing Section ---
+        routing_section(ui, context, &net_config.routing);
+
+        ui.add_space(4.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        // --- Interface Summary ---
+        iface_config_section(ui, context, &net_config.interfaces);
+    });
+}
+
+/// DNS information section.
+fn dns_section(ui: &mut Ui, context: &SectionContext<'_>, dns: &super::net_config::DnsConfig) {
+    let theme = context.theme;
+    ui.label(
+        RichText::new("DNS")
+            .font(FontId::proportional(11.0))
+            .color(theme.ui.text)
+            .strong(),
+    );
+
+    if !dns.available {
+        ui.label(
+            RichText::new("DNS configuration unavailable")
+                .font(FontId::proportional(10.0))
+                .color(theme.ui.secondary_text),
+        );
+        return;
+    }
+
+    Grid::new("net-config-dns-grid")
+        .num_columns(2)
+        .spacing(egui::vec2(16.0, 4.0))
+        .min_col_width(100.0)
+        .show(ui, |ui| {
+            for ns in &dns.ipv4_nameservers {
+                detail_row(ui, theme, "Nameserver (IPv4)", Some(ns));
+            }
+            for ns in &dns.ipv6_nameservers {
+                detail_row(ui, theme, "Nameserver (IPv6)", Some(ns));
+            }
+            if !dns.search_domains.is_empty() {
+                detail_row(ui, theme, "Search", Some(&dns.search_domains.join(", ")));
+            }
+            if let Some(ref domain) = dns.domain {
+                detail_row(ui, theme, "Domain", Some(domain));
+            }
+            if dns.ipv4_nameservers.is_empty()
+                && dns.ipv6_nameservers.is_empty()
+                && dns.search_domains.is_empty()
+                && dns.domain.is_none()
+            {
+                detail_row(ui, theme, "Status", Some("No nameservers configured"));
+            }
+            ui.end_row();
+        });
+}
+
+/// Routing table section.
+fn routing_section(
+    ui: &mut Ui,
+    context: &SectionContext<'_>,
+    routing: &super::net_config::RoutingTable,
+) {
+    let theme = context.theme;
+    ui.label(
+        RichText::new("Routing")
+            .font(FontId::proportional(11.0))
+            .color(theme.ui.text)
+            .strong(),
+    );
+
+    if !routing.available {
+        ui.label(
+            RichText::new("Routing information unavailable")
+                .font(FontId::proportional(10.0))
+                .color(theme.ui.secondary_text),
+        );
+        return;
+    }
+
+    // IPv4 routes
+    if !routing.ipv4_routes.is_empty() {
+        ui.label(
+            RichText::new(format!("IPv4 Routes ({})", routing.ipv4_routes.len()))
+                .font(FontId::proportional(10.0))
+                .color(theme.ui.secondary_text),
+        );
+
+        // Table header
+        ui.horizontal(|ui| {
+            config_header_cell(ui, theme, "DEST", 100.0);
+            config_header_cell(ui, theme, "GATEWAY", 100.0);
+            config_header_cell(ui, theme, "IFACE", 60.0);
+            config_header_cell(ui, theme, "FLAGS", 60.0);
+            config_header_cell(ui, theme, "METRIC", 50.0);
+        });
+        ui.separator();
+
+        let max_routes = 12;
+        let visible = routing.ipv4_routes.len().min(max_routes);
+        let row_height = 16.0;
+
+        egui::ScrollArea::vertical()
+            .id_salt("net-config-ipv4-routes")
+            .max_height(row_height * visible as f32 + 4.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for route in &routing.ipv4_routes {
+                    route_row(ui, theme, route);
+                }
+            });
+
+        if routing.ipv4_routes.len() > max_routes {
+            ui.label(
+                RichText::new(format!(
+                    "Showing {max_routes} of {} routes",
+                    routing.ipv4_routes.len()
+                ))
+                .font(FontId::proportional(9.0))
+                .color(theme.ui.secondary_text),
+            );
+        }
+    }
+
+    // IPv6 routes
+    if !routing.ipv6_routes.is_empty() {
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(format!("IPv6 Routes ({})", routing.ipv6_routes.len()))
+                .font(FontId::proportional(10.0))
+                .color(theme.ui.secondary_text),
+        );
+
+        ui.horizontal(|ui| {
+            config_header_cell(ui, theme, "DESTINATION", 200.0);
+            config_header_cell(ui, theme, "PREFIX", 50.0);
+            config_header_cell(ui, theme, "IFACE", 60.0);
+        });
+        ui.separator();
+
+        let max_routes = 8;
+        let visible = routing.ipv6_routes.len().min(max_routes);
+        let row_height = 16.0;
+
+        egui::ScrollArea::vertical()
+            .id_salt("net-config-ipv6-routes")
+            .max_height(row_height * visible as f32 + 4.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for route in &routing.ipv6_routes {
+                    ipv6_route_row(ui, theme, route);
+                }
+            });
+    }
+}
+
+/// Single IPv4 route row.
+fn route_row(ui: &mut Ui, theme: &Theme, route: &super::net_config::Ipv4Route) {
+    let h = 16.0;
+    let flags_str = super::net_config::decode_route_flags(route.flags).join(", ");
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            egui::vec2(100.0, h),
+            egui::Label::new(
+                RichText::new(&route.destination)
+                    .font(FontId::monospace(9.0))
+                    .color(theme.ui.text),
+            ),
+        );
+        ui.add_sized(
+            egui::vec2(100.0, h),
+            egui::Label::new(
+                RichText::new(&route.gateway)
+                    .font(FontId::monospace(9.0))
+                    .color(theme.ui.secondary_text),
+            ),
+        );
+        ui.add_sized(
+            egui::vec2(60.0, h),
+            egui::Label::new(
+                RichText::new(&route.interface)
+                    .font(FontId::monospace(9.0))
+                    .color(theme.ui.text),
+            ),
+        );
+        let flags_color = if route.flags & 0x0004 != 0 {
+            theme.ui.accent
+        } else {
+            theme.ui.secondary_text
+        };
+        ui.add_sized(
+            egui::vec2(60.0, h),
+            egui::Label::new(
+                RichText::new(&flags_str)
+                    .font(FontId::monospace(9.0))
+                    .color(flags_color),
+            ),
+        );
+        ui.add_sized(
+            egui::vec2(50.0, h),
+            egui::Label::new(
+                RichText::new(route.metric.to_string())
+                    .font(FontId::monospace(9.0))
+                    .color(theme.ui.secondary_text),
+            ),
+        );
+    });
+}
+
+/// Single IPv6 route row.
+fn ipv6_route_row(ui: &mut Ui, theme: &Theme, route: &super::net_config::Ipv6Route) {
+    let h = 16.0;
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            egui::vec2(200.0, h),
+            egui::Label::new(
+                RichText::new(&route.destination)
+                    .font(FontId::monospace(9.0))
+                    .color(theme.ui.text),
+            ),
+        );
+        ui.add_sized(
+            egui::vec2(50.0, h),
+            egui::Label::new(
+                RichText::new(route.prefix_len.to_string())
+                    .font(FontId::monospace(9.0))
+                    .color(theme.ui.secondary_text),
+            ),
+        );
+        ui.add_sized(
+            egui::vec2(60.0, h),
+            egui::Label::new(
+                RichText::new(&route.interface)
+                    .font(FontId::monospace(9.0))
+                    .color(theme.ui.text),
+            ),
+        );
+    });
+}
+
+/// Interface configuration summary section.
+fn iface_config_section(
+    ui: &mut Ui,
+    context: &SectionContext<'_>,
+    interfaces: &[super::net_config::InterfaceConfig],
+) {
+    let theme = context.theme;
+    ui.label(
+        RichText::new("Interface Configuration")
+            .font(FontId::proportional(11.0))
+            .color(theme.ui.text)
+            .strong(),
+    );
+
+    if interfaces.is_empty() {
+        ui.label(
+            RichText::new("No interface configuration available")
+                .font(FontId::proportional(10.0))
+                .color(theme.ui.secondary_text),
+        );
+        return;
+    }
+
+    // Table header
+    ui.horizontal(|ui| {
+        config_header_cell(ui, theme, "NAME", 80.0);
+        config_header_cell(ui, theme, "STATE", 50.0);
+        config_header_cell(ui, theme, "MAC", 120.0);
+        config_header_cell(ui, theme, "MTU", 48.0);
+        config_header_cell(ui, theme, "SPEED", 56.0);
+        config_header_cell(ui, theme, "CARRIER", 52.0);
+    });
+    ui.separator();
+
+    let row_height = 16.0;
+    let max_rows = 8;
+    let visible = interfaces.len().min(max_rows);
+
+    egui::ScrollArea::vertical()
+        .id_salt("net-config-iface-summary")
+        .max_height(row_height * visible as f32 + 4.0)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for iface in interfaces {
+                iface_config_row(ui, context, iface);
+            }
+        });
+}
+
+/// Single interface configuration row.
+fn iface_config_row(
+    ui: &mut Ui,
+    context: &SectionContext<'_>,
+    iface: &super::net_config::InterfaceConfig,
+) {
+    let theme = context.theme;
+    let h = 16.0;
+    let state_color = match iface.state.as_str() {
+        "up" => theme.status.success,
+        "down" => theme.status.error,
+        _ => theme.ui.secondary_text,
+    };
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            egui::vec2(80.0, h),
+            egui::Label::new(
+                RichText::new(truncate_str(&iface.name, 10))
+                    .font(FontId::monospace(9.0))
+                    .color(theme.ui.text),
+            ),
+        );
+        ui.add_sized(
+            egui::vec2(50.0, h),
+            egui::Label::new(
+                RichText::new(iface.state.to_uppercase())
+                    .font(FontId::monospace(9.0))
+                    .color(state_color),
+            ),
+        );
+        let mac = iface.mac.as_deref().unwrap_or("--");
+        ui.add_sized(
+            egui::vec2(120.0, h),
+            egui::Label::new(
+                RichText::new(truncate_str(mac, 17))
+                    .font(FontId::monospace(9.0))
+                    .color(theme.ui.secondary_text),
+            ),
+        );
+        let mtu = iface
+            .mtu
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| "--".into());
+        ui.add_sized(
+            egui::vec2(48.0, h),
+            egui::Label::new(
+                RichText::new(mtu)
+                    .font(FontId::monospace(9.0))
+                    .color(theme.ui.secondary_text),
+            ),
+        );
+        let speed = iface
+            .speed
+            .map(|s| format!("{s} Mb"))
+            .unwrap_or_else(|| "--".into());
+        ui.add_sized(
+            egui::vec2(56.0, h),
+            egui::Label::new(
+                RichText::new(speed)
+                    .font(FontId::monospace(9.0))
+                    .color(theme.ui.secondary_text),
+            ),
+        );
+        let carrier = match iface.carrier {
+            Some(true) => "Yes",
+            Some(false) => "No",
+            None => "--",
+        };
+        let carrier_color = match iface.carrier {
+            Some(true) => theme.status.success,
+            Some(false) => theme.status.error,
+            None => theme.ui.secondary_text,
+        };
+        ui.add_sized(
+            egui::vec2(52.0, h),
+            egui::Label::new(
+                RichText::new(carrier)
+                    .font(FontId::monospace(9.0))
+                    .color(carrier_color),
+            ),
+        );
+    });
+}
+
+fn config_header_cell(ui: &mut Ui, theme: &Theme, label: &str, width: f32) {
+    ui.add_sized(
+        egui::vec2(width, 14.0),
+        egui::Label::new(
+            RichText::new(label)
+                .font(FontId::monospace(9.0))
+                .color(theme.ui.secondary_text)
+                .strong(),
+        ),
+    );
 }
 
 // ---------------------------------------------------------------------------

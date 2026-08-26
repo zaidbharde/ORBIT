@@ -10,6 +10,7 @@
 
 pub mod connections;
 pub mod dashboard;
+pub mod net_config;
 pub mod process_mapping;
 
 use super::{Section, SectionContext, SectionId};
@@ -26,6 +27,7 @@ pub struct NetworkingSection {
     monitor: NetworkMonitor,
     connection_snapshot: connections::ConnectionSnapshot,
     inode_map: process_mapping::InodeMap,
+    net_config: net_config::NetworkConfigSnapshot,
     last_collect: Option<Instant>,
 }
 
@@ -35,6 +37,7 @@ impl NetworkingSection {
             monitor: NetworkMonitor::new(),
             connection_snapshot: connections::ConnectionSnapshot::default(),
             inode_map: process_mapping::InodeMap::default(),
+            net_config: net_config::NetworkConfigSnapshot::default(),
             last_collect: None,
         }
     }
@@ -56,6 +59,7 @@ impl Section for NetworkingSection {
             self.inode_map = process_mapping::InodeMap::collect();
             self.connection_snapshot
                 .enrich_with_processes(&self.inode_map);
+            self.net_config = net_config::NetworkConfigSnapshot::collect();
             self.last_collect = Some(now);
             ctx.request_repaint();
         }
@@ -70,6 +74,7 @@ impl Section for NetworkingSection {
         let rx_history = self.monitor.rx_history.clone();
         let tx_history = self.monitor.tx_history.clone();
         let conn_snapshot = self.connection_snapshot.clone();
+        let net_config = self.net_config.clone();
 
         egui::ScrollArea::vertical()
             .id_salt("networking-section")
@@ -86,6 +91,7 @@ impl Section for NetworkingSection {
                     &rx_history,
                     &tx_history,
                     &conn_snapshot,
+                    &net_config,
                 );
                 ui.response()
             })
