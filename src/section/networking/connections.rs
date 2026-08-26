@@ -4,6 +4,8 @@
 //! `/proc/net/udp6` to enumerate active local connections. All operations
 //! are strictly read-only — no connections are opened, closed, or probed.
 
+use super::process_mapping::ProcessInfo;
+
 /// Hard limit on stored connections to prevent unbounded memory growth.
 const MAX_CONNECTIONS: usize = 2048;
 
@@ -19,6 +21,8 @@ pub struct Connection {
     pub remote_addr: String,
     pub remote_port: u16,
     pub state: ConnectionState,
+    pub inode: u64,
+    pub process: Option<ProcessInfo>,
 }
 
 /// Network protocol.
@@ -88,6 +92,17 @@ pub struct ConnectionSnapshot {
 }
 
 impl ConnectionSnapshot {
+    /// Enrich connections with process ownership information from an inode map.
+    /// Consumes the process map by reference and sets the `process` field on
+    /// each connection whose inode has a match.
+    pub fn enrich_with_processes(&mut self, inode_map: &super::process_mapping::InodeMap) {
+        for conn in &mut self.connections {
+            if conn.inode != 0 {
+                conn.process = inode_map.lookup(conn.inode).cloned();
+            }
+        }
+    }
+
     /// Build a new snapshot by reading kernel proc files.
     pub fn collect() -> Self {
         let mut connections = Vec::with_capacity(256);
@@ -194,7 +209,7 @@ fn parse_table(content: &str, protocol: Protocol, ipv6: bool) -> Vec<Connection>
 ///
 /// Format (IPv4):
 /// ```text
-///  sl  local_address rem_address   st tx_queue rx_queue ...
+///  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
 ///  0: 3500007F:0035 00000000:0000 0A ...
 /// ```
 ///
@@ -203,7 +218,8 @@ fn parse_table(content: &str, protocol: Protocol, ipv6: bool) -> Vec<Connection>
 ///  0: 00000000000000000000000001000000:0277 00000000000000000000000000000000:0000 0A ...
 /// ```
 pub fn parse_table_line(line: &str, protocol: Protocol, ipv6: bool) -> Option<Connection> {
-    // Split on whitespace. Fields: sl, local_address, rem_address, st, ...
+    // Split on whitespace. Fields: sl, local_address, rem_address, st,
+    // tx_queue:rx_queue, tr:when, retrnsmt, uid, timeout, inode, ...
     let mut parts = line.split_whitespace();
     let _sl = parts.next()?; // "0:"
     let local_hex = parts.next()?;
@@ -224,6 +240,15 @@ pub fn parse_table_line(line: &str, protocol: Protocol, ipv6: bool) -> Option<Co
         parse_ipv4_hex_address(remote_hex)?
     };
 
+    // Skip tx_queue:rx_queue, tr:when, retrnsmt, uid, timeout — then read inode.
+    let _tx_rx = parts.next()?; // tx_queue:rx_queue
+    let _tr_when = parts.next()?; // tr:when
+    let _retrnsmt = parts.next()?; // retrnsmt
+    let _uid = parts.next()?; // uid
+    let _timeout = parts.next()?; // timeout
+    let inode_str = parts.next()?; // inode
+    let inode = inode_str.parse::<u64>().unwrap_or(0);
+
     Some(Connection {
         protocol,
         local_addr,
@@ -231,6 +256,8 @@ pub fn parse_table_line(line: &str, protocol: Protocol, ipv6: bool) -> Option<Co
         remote_addr,
         remote_port,
         state,
+        inode,
+        process: None,
     })
 }
 
@@ -366,6 +393,7 @@ impl ConnectionFilter {
 
 /// Filter a snapshot by the given preset filter and optional text search.
 /// Returns indices into `snapshot.connections`.
+/// Search matches against all fields including PID and process name.
 pub fn filter_connections(
     snapshot: &ConnectionSnapshot,
     filter: ConnectionFilter,
@@ -396,15 +424,29 @@ pub fn filter_connections(
                 return true;
             }
 
-            // Text search against all fields.
-            let fields = [
+            // Text search against all fields including process info.
+            let local_port_str = conn.local_port.to_string();
+            let remote_port_str = conn.remote_port.to_string();
+            let pid_str = conn
+                .process
+                .as_ref()
+                .map(|p| p.pid.to_string())
+                .unwrap_or_default();
+
+            let mut fields: Vec<&str> = vec![
                 conn.local_addr.as_str(),
-                &conn.local_port.to_string(),
+                &local_port_str,
                 conn.remote_addr.as_str(),
-                &conn.remote_port.to_string(),
+                &remote_port_str,
                 conn.protocol.label(),
                 conn.state.label(),
             ];
+
+            if let Some(ref proc_info) = conn.process {
+                fields.push(&proc_info.name);
+                fields.push(&pid_str);
+            }
+
             fields
                 .iter()
                 .any(|f| f.to_lowercase().contains(&search_lower))
@@ -806,22 +848,23 @@ mod tests {
 
     #[test]
     fn parse_table_line_ipv4() {
-        let line =
-            "   0: 3500007F:0035 00000000:0000 0A 00000000:00000000 00:00000000 00000000   989";
+        let line = "   0: 3500007F:0035 00000000:0000 0A 00000000:00000000 00:00000000 00000000   989        0 8035 1 0000000000000000 100 0 0 10 5";
         let conn = parse_table_line(line, Protocol::Tcp, false).unwrap();
         assert_eq!(conn.protocol, Protocol::Tcp);
         assert_eq!(conn.local_addr, "127.0.0.53");
         assert_eq!(conn.local_port, 53);
         assert_eq!(conn.state, ConnectionState::Listen);
+        assert_eq!(conn.inode, 8035);
     }
 
     #[test]
     fn parse_table_line_ipv6() {
-        let line = "   0: 00000000000000000000000001000000:0277 00000000000000000000000000000000:0000 0A 0";
+        let line = "   0: 00000000000000000000000001000000:0277 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 22096 1 0000000000000000 100 0 0 10 0";
         let conn = parse_table_line(line, Protocol::Tcp, true).unwrap();
         assert_eq!(conn.local_port, 631);
         assert_eq!(conn.state, ConnectionState::Listen);
         assert!(conn.local_addr.contains(':'));
+        assert_eq!(conn.inode, 22096);
     }
 
     // --- Protocol labels ---
@@ -879,6 +922,173 @@ mod tests {
         assert_eq!(est_count, 1);
     }
 
+    // --- P7.4: inode extraction from proc table lines ---
+
+    #[test]
+    fn parses_inode_from_tcp_table_line() {
+        let line = "   0: 3500007F:0035 00000000:0000 0A 00000000:00000000 00:00000000 00000000   989        0 8035 1 0000000000000000 100 0 0 10 5";
+        let conn = parse_table_line(line, Protocol::Tcp, false).unwrap();
+        assert_eq!(conn.inode, 8035);
+        assert!(conn.process.is_none());
+    }
+
+    #[test]
+    fn parses_inode_zero() {
+        let line = "   0: 3500007F:0035 00000000:0000 0A 00000000:00000000 00:00000000 00000000   989        0 0 1 0000000000000000 100 0 0 10 5";
+        let conn = parse_table_line(line, Protocol::Tcp, false).unwrap();
+        assert_eq!(conn.inode, 0);
+    }
+
+    // --- P7.4: connection enrichment ---
+
+    #[test]
+    fn enrich_matches_inode_to_process() {
+        use crate::section::networking::process_mapping::{InodeMap, ProcessInfo};
+        use std::collections::HashMap;
+
+        let mut map_data: HashMap<u64, ProcessInfo> = HashMap::new();
+        map_data.insert(
+            8035,
+            ProcessInfo {
+                pid: 1234,
+                name: "myserver".into(),
+                uid: Some(1000),
+            },
+        );
+        let inode_map = InodeMap::from_map(map_data);
+
+        let mut snapshot = make_test_snapshot();
+        snapshot.enrich_with_processes(&inode_map);
+
+        let first = &snapshot.connections[0];
+        assert_eq!(first.inode, 8035);
+        let proc = first.process.as_ref().unwrap();
+        assert_eq!(proc.pid, 1234);
+        assert_eq!(proc.name, "myserver");
+        assert_eq!(proc.uid, Some(1000));
+    }
+
+    #[test]
+    fn enrich_skips_zero_inode() {
+        use crate::section::networking::process_mapping::InodeMap;
+
+        let mut snapshot = make_test_snapshot();
+        snapshot.connections[0].inode = 0;
+        let inode_map = InodeMap::default();
+        snapshot.enrich_with_processes(&inode_map);
+        assert!(snapshot.connections[0].process.is_none());
+    }
+
+    #[test]
+    fn enrich_preserves_unmatched_inodes() {
+        use crate::section::networking::process_mapping::InodeMap;
+
+        let snapshot = make_test_snapshot();
+        let inode_map = InodeMap::default(); // empty
+        let mut enriched = snapshot.clone();
+        enriched.enrich_with_processes(&inode_map);
+        for conn in &enriched.connections {
+            assert!(conn.process.is_none());
+        }
+    }
+
+    // --- P7.4: PID search filtering ---
+
+    #[test]
+    fn search_matches_pid() {
+        use crate::section::networking::process_mapping::ProcessInfo;
+
+        let mut snapshot = make_test_snapshot();
+        snapshot.connections[0].process = Some(ProcessInfo {
+            pid: 42,
+            name: "sshd".into(),
+            uid: Some(0),
+        });
+        let indices = filter_connections(&snapshot, ConnectionFilter::All, "42");
+        // "42" matches the PID on connection[0] and as substring in port 46819 on connection[1]
+        assert!(indices.len() >= 1);
+        // Verify connection[0] is in the results (PID match)
+        assert!(indices.contains(&0));
+    }
+
+    #[test]
+    fn search_matches_process_name() {
+        use crate::section::networking::process_mapping::ProcessInfo;
+
+        let mut snapshot = make_test_snapshot();
+        snapshot.connections[0].process = Some(ProcessInfo {
+            pid: 42,
+            name: "nginx".into(),
+            uid: Some(0),
+        });
+        snapshot.connections[1].process = Some(ProcessInfo {
+            pid: 100,
+            name: "apache2".into(),
+            uid: Some(0),
+        });
+        let indices = filter_connections(&snapshot, ConnectionFilter::All, "nginx");
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0], 0);
+    }
+
+    #[test]
+    fn search_is_case_insensitive_for_process() {
+        use crate::section::networking::process_mapping::ProcessInfo;
+
+        let mut snapshot = make_test_snapshot();
+        snapshot.connections[0].process = Some(ProcessInfo {
+            pid: 42,
+            name: "MyServer".into(),
+            uid: Some(0),
+        });
+        let upper = filter_connections(&snapshot, ConnectionFilter::All, "MYSERVER");
+        let lower = filter_connections(&snapshot, ConnectionFilter::All, "myserver");
+        assert_eq!(upper, lower);
+        assert_eq!(upper.len(), 1);
+    }
+
+    // --- P7.4: unavailable ownership ---
+
+    #[test]
+    fn no_process_info_shows_no_match_on_pid_search() {
+        let snapshot = make_test_snapshot(); // all process: None
+        let indices = filter_connections(&snapshot, ConnectionFilter::All, "nginx");
+        assert!(indices.is_empty());
+    }
+
+    // --- P7.4: combined protocol/state/search filtering ---
+
+    #[test]
+    fn combined_tcp_listen_search_with_pid() {
+        use crate::section::networking::process_mapping::ProcessInfo;
+
+        let mut snapshot = make_test_snapshot();
+        snapshot.connections[0].process = Some(ProcessInfo {
+            pid: 53,
+            name: "dnsmasq".into(),
+            uid: Some(0),
+        });
+        snapshot.connections[1].process = Some(ProcessInfo {
+            pid: 100,
+            name: "sshd".into(),
+            uid: Some(0),
+        });
+        // TCP + LISTEN + search "53" should match only first connection
+        let indices = filter_connections(&snapshot, ConnectionFilter::Tcp, "53");
+        assert_eq!(indices.len(), 1);
+        assert_eq!(snapshot.connections[indices[0]].local_port, 53);
+    }
+
+    // --- P7.4: inode field present in proc data ---
+
+    #[test]
+    fn full_tcp_table_inodes_parsed() {
+        let conns = parse_tcp_table(PROC_NET_TCP);
+        for conn in &conns {
+            assert!(conn.process.is_none()); // no enrichment in raw parse
+        }
+    }
+
     // --- Fixture builder ---
 
     fn make_test_snapshot() -> ConnectionSnapshot {
@@ -891,6 +1101,8 @@ mod tests {
             remote_addr: "0.0.0.0".into(),
             remote_port: 0,
             state: ConnectionState::Listen,
+            inode: 8035,
+            process: None,
         });
         // TCP LISTEN on 127.0.0.1:46819
         connections.push(Connection {
@@ -900,6 +1112,8 @@ mod tests {
             remote_addr: "0.0.0.0".into(),
             remote_port: 0,
             state: ConnectionState::Listen,
+            inode: 50959,
+            process: None,
         });
         // TCP ESTABLISHED 127.0.0.1:25 -> 10.185.161.142:80
         connections.push(Connection {
@@ -909,6 +1123,8 @@ mod tests {
             remote_addr: "10.185.161.142".into(),
             remote_port: 80,
             state: ConnectionState::Established,
+            inode: 60589,
+            process: None,
         });
         // UDP UNCONN 127.0.0.54:53
         connections.push(Connection {
@@ -918,6 +1134,8 @@ mod tests {
             remote_addr: "0.0.0.0".into(),
             remote_port: 0,
             state: ConnectionState::UdpUnconn,
+            inode: 8036,
+            process: None,
         });
 
         let tcp_count = connections

@@ -697,6 +697,7 @@ fn connections_card(ui: &mut Ui, context: &SectionContext<'_>, snapshot: &Connec
         // Filter buttons.
         let mem_id = ui.id().with("conn-filter-state");
         let search_id = ui.id().with("conn-search-text");
+        let selected_id = ui.id().with("conn-selected-idx");
 
         let active_filter = ui.memory_mut(|m| m.data.get_persisted::<usize>(mem_id).unwrap_or(0));
 
@@ -738,7 +739,7 @@ fn connections_card(ui: &mut Ui, context: &SectionContext<'_>, snapshot: &Connec
             let response = ui.add_sized(
                 egui::vec2(200.0, 18.0),
                 egui::TextEdit::singleline(&mut search_text)
-                    .hint_text("address, port, protocol, state...")
+                    .hint_text("address, port, protocol, state, PID, process...")
                     .font(FontId::monospace(10.0)),
             );
             if response.changed() {
@@ -764,12 +765,14 @@ fn connections_card(ui: &mut Ui, context: &SectionContext<'_>, snapshot: &Connec
 
         // Table header.
         ui.horizontal(|ui| {
-            conn_header_cell(ui, theme, "PROTO", 52.0);
-            conn_header_cell(ui, theme, "LOCAL ADDR", 140.0);
-            conn_header_cell(ui, theme, "PORT", 56.0);
-            conn_header_cell(ui, theme, "REMOTE ADDR", 140.0);
-            conn_header_cell(ui, theme, "PORT", 56.0);
-            conn_header_cell(ui, theme, "STATE", 80.0);
+            conn_header_cell(ui, theme, "PROTO", 48.0);
+            conn_header_cell(ui, theme, "LOCAL ADDR", 130.0);
+            conn_header_cell(ui, theme, "PORT", 52.0);
+            conn_header_cell(ui, theme, "REMOTE ADDR", 130.0);
+            conn_header_cell(ui, theme, "PORT", 52.0);
+            conn_header_cell(ui, theme, "STATE", 76.0);
+            conn_header_cell(ui, theme, "PID", 52.0);
+            conn_header_cell(ui, theme, "PROCESS", 80.0);
         });
         ui.separator();
 
@@ -778,15 +781,46 @@ fn connections_card(ui: &mut Ui, context: &SectionContext<'_>, snapshot: &Connec
         let max_rows = 15;
         let visible_rows = render_count.min(max_rows);
 
+        // Read selected index from persisted memory.
+        let selected_idx: Option<usize> =
+            ui.memory_mut(|m| m.data.get_persisted::<usize>(selected_id));
+
+        let mut new_selected: Option<usize> = selected_idx;
+
         egui::ScrollArea::vertical()
             .id_salt("networking-connections-list")
             .max_height(row_height * visible_rows as f32 + 4.0)
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for &idx in indices.iter().take(render_count) {
-                    conn_row(ui, context, &snapshot.connections[idx], row_height);
+                    let is_selected = selected_idx == Some(idx);
+                    let resp = conn_row(
+                        ui,
+                        context,
+                        &snapshot.connections[idx],
+                        row_height,
+                        is_selected,
+                    );
+                    if resp.clicked() {
+                        new_selected = if selected_idx == Some(idx) {
+                            None
+                        } else {
+                            Some(idx)
+                        };
+                    }
                 }
             });
+
+        if new_selected != selected_idx {
+            match new_selected {
+                Some(idx) => {
+                    ui.memory_mut(|m| m.data.insert_persisted(selected_id, idx));
+                }
+                None => {
+                    ui.memory_mut(|m| m.data.remove::<usize>(selected_id));
+                }
+            }
+        }
 
         if indices.len() > MAX_RENDERED_ROWS {
             ui.label(
@@ -797,6 +831,16 @@ fn connections_card(ui: &mut Ui, context: &SectionContext<'_>, snapshot: &Connec
                 .font(FontId::proportional(9.0))
                 .color(theme.ui.secondary_text),
             );
+        }
+
+        // Detail panel for selected connection.
+        if let Some(sel) = new_selected {
+            if sel < snapshot.connections.len() {
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(2.0);
+                connection_detail(ui, context, &snapshot.connections[sel]);
+            }
         }
     });
 }
@@ -818,8 +862,9 @@ fn conn_row(
     context: &SectionContext<'_>,
     conn: &crate::section::networking::connections::Connection,
     height: f32,
-) {
-    use crate::section::networking::connections::{ConnectionState, Protocol};
+    is_selected: bool,
+) -> egui::Response {
+    use crate::section::networking::connections::ConnectionState;
 
     let theme = context.theme;
     let state_color = match conn.state {
@@ -830,59 +875,175 @@ fn conn_row(
         _ => theme.ui.text,
     };
 
-    ui.horizontal(|ui| {
-        ui.add_sized(
-            egui::vec2(52.0, height),
-            egui::Label::new(
-                RichText::new(conn.protocol.label())
-                    .font(FontId::monospace(10.0))
-                    .color(match conn.protocol {
-                        Protocol::Tcp => theme.ui.accent,
-                        Protocol::Udp => theme.status.warning,
-                    }),
-            ),
-        );
-        ui.add_sized(
-            egui::vec2(140.0, height),
-            egui::Label::new(
-                RichText::new(truncate_str(&conn.local_addr, 18))
-                    .font(FontId::monospace(10.0))
-                    .color(theme.ui.text),
-            ),
-        );
-        ui.add_sized(
-            egui::vec2(56.0, height),
-            egui::Label::new(
-                RichText::new(conn.local_port.to_string())
-                    .font(FontId::monospace(10.0))
-                    .color(theme.ui.text),
-            ),
-        );
-        ui.add_sized(
-            egui::vec2(140.0, height),
-            egui::Label::new(
-                RichText::new(truncate_str(&conn.remote_addr, 18))
-                    .font(FontId::monospace(10.0))
-                    .color(theme.ui.secondary_text),
-            ),
-        );
-        ui.add_sized(
-            egui::vec2(56.0, height),
-            egui::Label::new(
-                RichText::new(conn.remote_port.to_string())
-                    .font(FontId::monospace(10.0))
-                    .color(theme.ui.secondary_text),
-            ),
-        );
-        ui.add_sized(
-            egui::vec2(80.0, height),
-            egui::Label::new(
-                RichText::new(conn.state.label())
-                    .font(FontId::monospace(9.0))
-                    .color(state_color),
-            ),
-        );
-    });
+    let frame_fill = if is_selected {
+        with_alpha(theme.ui.accent, 0.12)
+    } else {
+        Color32::TRANSPARENT
+    };
+
+    let resp = if is_selected {
+        let frame = Frame::new()
+            .fill(frame_fill)
+            .inner_margin(Margin::symmetric(2, 0));
+        frame
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    conn_row_inner(ui, conn, theme, height, state_color);
+                })
+            })
+            .response
+    } else {
+        ui.horizontal(|ui| {
+            conn_row_inner(ui, conn, theme, height, state_color);
+        })
+        .response
+    };
+
+    resp.interact(egui::Sense::click())
+}
+
+fn conn_row_inner(
+    ui: &mut Ui,
+    conn: &crate::section::networking::connections::Connection,
+    theme: &Theme,
+    height: f32,
+    state_color: Color32,
+) {
+    use crate::section::networking::connections::Protocol;
+
+    ui.add_sized(
+        egui::vec2(48.0, height),
+        egui::Label::new(
+            RichText::new(conn.protocol.label())
+                .font(FontId::monospace(10.0))
+                .color(match conn.protocol {
+                    Protocol::Tcp => theme.ui.accent,
+                    Protocol::Udp => theme.status.warning,
+                }),
+        ),
+    );
+    ui.add_sized(
+        egui::vec2(130.0, height),
+        egui::Label::new(
+            RichText::new(truncate_str(&conn.local_addr, 16))
+                .font(FontId::monospace(10.0))
+                .color(theme.ui.text),
+        ),
+    );
+    ui.add_sized(
+        egui::vec2(52.0, height),
+        egui::Label::new(
+            RichText::new(conn.local_port.to_string())
+                .font(FontId::monospace(10.0))
+                .color(theme.ui.text),
+        ),
+    );
+    ui.add_sized(
+        egui::vec2(130.0, height),
+        egui::Label::new(
+            RichText::new(truncate_str(&conn.remote_addr, 16))
+                .font(FontId::monospace(10.0))
+                .color(theme.ui.secondary_text),
+        ),
+    );
+    ui.add_sized(
+        egui::vec2(52.0, height),
+        egui::Label::new(
+            RichText::new(conn.remote_port.to_string())
+                .font(FontId::monospace(10.0))
+                .color(theme.ui.secondary_text),
+        ),
+    );
+    ui.add_sized(
+        egui::vec2(76.0, height),
+        egui::Label::new(
+            RichText::new(conn.state.label())
+                .font(FontId::monospace(9.0))
+                .color(state_color),
+        ),
+    );
+    // PID column.
+    let pid_text = conn
+        .process
+        .as_ref()
+        .map(|p| p.pid.to_string())
+        .unwrap_or_else(|| "—".into());
+    ui.add_sized(
+        egui::vec2(52.0, height),
+        egui::Label::new(
+            RichText::new(pid_text)
+                .font(FontId::monospace(10.0))
+                .color(theme.ui.text),
+        ),
+    );
+    // Process column.
+    let proc_text = conn
+        .process
+        .as_ref()
+        .map(|p| truncate_str(&p.name, 10).to_string())
+        .unwrap_or_else(|| "—".into());
+    ui.add_sized(
+        egui::vec2(80.0, height),
+        egui::Label::new(
+            RichText::new(proc_text)
+                .font(FontId::monospace(10.0))
+                .color(theme.ui.text),
+        ),
+    );
+}
+
+/// Detail panel for a selected connection.
+fn connection_detail(
+    ui: &mut Ui,
+    context: &SectionContext<'_>,
+    conn: &crate::section::networking::connections::Connection,
+) {
+    let theme = context.theme;
+
+    ui.label(
+        RichText::new("Connection Detail")
+            .font(FontId::proportional(11.0))
+            .color(theme.ui.secondary_text)
+            .strong(),
+    );
+
+    Grid::new("conn-detail-grid")
+        .num_columns(2)
+        .spacing(egui::vec2(16.0, 4.0))
+        .min_col_width(100.0)
+        .show(ui, |ui| {
+            detail_row(ui, theme, "Protocol", Some(conn.protocol.label()));
+            detail_row(
+                ui,
+                theme,
+                "Local Endpoint",
+                Some(&format!("{}:{}", conn.local_addr, conn.local_port)),
+            );
+            detail_row(
+                ui,
+                theme,
+                "Remote Endpoint",
+                Some(&format!("{}:{}", conn.remote_addr, conn.remote_port)),
+            );
+            detail_row(ui, theme, "State", Some(conn.state.label()));
+            ui.end_row();
+
+            if let Some(ref proc_info) = conn.process {
+                detail_row(ui, theme, "PID", Some(&proc_info.pid.to_string()));
+                detail_row(ui, theme, "Process", Some(&proc_info.name));
+                detail_row(
+                    ui,
+                    theme,
+                    "UID",
+                    proc_info.uid.map(|u| u.to_string()).as_deref(),
+                );
+            } else {
+                detail_row(ui, theme, "PID", None);
+                detail_row(ui, theme, "Process", None);
+                detail_row(ui, theme, "UID", None);
+            }
+            ui.end_row();
+        });
 }
 
 // ---------------------------------------------------------------------------

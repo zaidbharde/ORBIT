@@ -10,6 +10,7 @@
 
 pub mod connections;
 pub mod dashboard;
+pub mod process_mapping;
 
 use super::{Section, SectionContext, SectionId};
 use crate::section::system::network::NetworkMonitor;
@@ -24,6 +25,7 @@ const COLLECT_INTERVAL: Duration = Duration::from_secs(1);
 pub struct NetworkingSection {
     monitor: NetworkMonitor,
     connection_snapshot: connections::ConnectionSnapshot,
+    inode_map: process_mapping::InodeMap,
     last_collect: Option<Instant>,
 }
 
@@ -32,6 +34,7 @@ impl NetworkingSection {
         Self {
             monitor: NetworkMonitor::new(),
             connection_snapshot: connections::ConnectionSnapshot::default(),
+            inode_map: process_mapping::InodeMap::default(),
             last_collect: None,
         }
     }
@@ -50,6 +53,9 @@ impl Section for NetworkingSection {
         if due {
             self.monitor.poll();
             self.connection_snapshot = connections::ConnectionSnapshot::collect();
+            self.inode_map = process_mapping::InodeMap::collect();
+            self.connection_snapshot
+                .enrich_with_processes(&self.inode_map);
             self.last_collect = Some(now);
             ctx.request_repaint();
         }
