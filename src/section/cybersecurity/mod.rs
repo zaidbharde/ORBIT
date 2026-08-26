@@ -1,11 +1,12 @@
 //! Cybersecurity section: read-only local security posture overview,
-//! security event monitoring, and hardening audit.
+//! security event monitoring, hardening audit, and exposure overview.
 //!
 //! Collects security-relevant information from Linux procfs, sysfs and
 //! safe local files once per ~1 Hz cycle. Rendering reads cached values only.
 //! All operations are strictly read-only — no modifications are made.
 
 pub mod dashboard;
+pub mod exposure_overview;
 pub mod hardening_audit;
 pub mod security_data;
 pub mod security_events;
@@ -23,6 +24,7 @@ pub struct CybersecuritySection {
     snapshot: security_data::SecuritySnapshot,
     event_log: security_events::EventLog,
     hardening_audit: hardening_audit::HardeningAudit,
+    exposure_overview: exposure_overview::ExposureOverview,
     last_collect: Option<Instant>,
 }
 
@@ -32,6 +34,7 @@ impl CybersecuritySection {
             snapshot: security_data::SecuritySnapshot::default(),
             event_log: security_events::EventLog::default(),
             hardening_audit: hardening_audit::HardeningAudit::default(),
+            exposure_overview: exposure_overview::ExposureOverview::default(),
             last_collect: None,
         }
     }
@@ -40,6 +43,12 @@ impl CybersecuritySection {
         self.snapshot = security_data::SecuritySnapshot::collect();
         self.event_log = security_events::collect_events(&self.event_log);
         self.hardening_audit = hardening_audit::collect_audit();
+
+        // Collect connection snapshot for exposure overview
+        let conn_snapshot = crate::section::networking::connections::ConnectionSnapshot::collect();
+        let firewall_active = self.snapshot.firewall.active_framework.is_some();
+        self.exposure_overview =
+            exposure_overview::collect_exposure(&conn_snapshot, Some(firewall_active));
     }
 }
 
@@ -64,11 +73,19 @@ impl Section for CybersecuritySection {
         let snapshot = self.snapshot.clone();
         let event_log = self.event_log.clone();
         let hardening_audit = self.hardening_audit.clone();
+        let exposure_overview = self.exposure_overview.clone();
         egui::ScrollArea::vertical()
             .id_salt("cybersecurity-dashboard")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                dashboard::show(ui, context, &snapshot, &event_log, &hardening_audit);
+                dashboard::show(
+                    ui,
+                    context,
+                    &snapshot,
+                    &event_log,
+                    &hardening_audit,
+                    &exposure_overview,
+                );
                 ui.response()
             })
             .inner
@@ -121,6 +138,7 @@ mod tests {
         assert!(section.snapshot.last_updated.is_none());
         assert!(section.event_log.is_empty());
         assert!(section.hardening_audit.is_empty());
+        assert!(!section.exposure_overview.data_available);
     }
 
     #[test]

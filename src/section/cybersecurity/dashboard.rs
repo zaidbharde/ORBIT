@@ -4,6 +4,9 @@
 //! values and paints themed cards. Data is collected by the section's update
 //! loop, never here.
 
+use super::exposure_overview::{
+    ExposureOverview, ExposureScope, ListenerFilter, ListenerStateFilter, RiskLevel,
+};
 use super::hardening_audit::{CheckCategory, CheckFilter, CheckStatus, HardeningAudit};
 use super::security_data::SecuritySnapshot;
 use super::security_events::{EventCategory, EventFilter, EventLog, Severity};
@@ -24,6 +27,7 @@ pub fn show(
     snapshot: &SecuritySnapshot,
     event_log: &EventLog,
     hardening_audit: &HardeningAudit,
+    exposure_overview: &ExposureOverview,
 ) {
     ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
 
@@ -36,6 +40,7 @@ pub fn show(
     auth_summary_card(ui, context, &snapshot.auth_summary);
     security_events_card(ui, context, event_log);
     hardening_audit_card(ui, context, hardening_audit);
+    exposure_overview_card(ui, context, exposure_overview);
 }
 
 // ---------------------------------------------------------------------------
@@ -1251,6 +1256,562 @@ fn check_detail_panel(ui: &mut Ui, theme: &Theme, check: &super::hardening_audit
                             .color(theme.ui.text),
                     );
                     ui.end_row();
+                });
+        });
+}
+
+// ---------------------------------------------------------------------------
+// Exposure Overview card
+// ---------------------------------------------------------------------------
+
+fn exposure_overview_card(ui: &mut Ui, context: &SectionContext<'_>, overview: &ExposureOverview) {
+    let theme = context.theme;
+    let panel_fill = context.panel_fill;
+    let appearance = context.appearance;
+    let border_stroke = if appearance.border_width > 0.0 {
+        Stroke::new(
+            appearance.border_width.clamp(0.0, 4.0),
+            with_alpha(theme.ui.border, appearance.border_opacity),
+        )
+    } else {
+        Stroke::NONE
+    };
+    let corner_radius = appearance.panel_radius.clamp(0.0, 16.0);
+
+    let (mut filter, mut selected_index) = {
+        let mem = ui.memory_mut(|m| {
+            let filter = m
+                .data
+                .get_persisted::<ListenerFilter>(egui::Id::new("cybersec_exposure_filter"))
+                .unwrap_or_default();
+            let sel = m
+                .data
+                .get_persisted::<Option<usize>>(egui::Id::new("cybersec_exposure_sel"));
+            (filter, sel)
+        });
+        (mem.0, mem.1.flatten())
+    };
+
+    Frame::new()
+        .fill(panel_fill)
+        .inner_margin(Margin::symmetric(12, 10))
+        .corner_radius(corner_radius)
+        .stroke(border_stroke)
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 6.0;
+
+            if !overview.data_available {
+                ui.label(
+                    RichText::new("Local exposure data unavailable on this platform")
+                        .font(FontId::proportional(11.0))
+                        .color(theme.ui.secondary_text),
+                );
+                return;
+            }
+
+            // Title row
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Local Exposure Overview")
+                        .font(FontId::proportional(13.0))
+                        .color(theme.ui.text)
+                        .strong(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(format!("{} listeners", overview.summary.total_listeners))
+                            .font(FontId::proportional(10.0))
+                            .color(theme.ui.secondary_text),
+                    );
+                });
+            });
+
+            // Risk indicator
+            let risk_color = match overview.summary.risk_level {
+                RiskLevel::Low => theme.status.success,
+                RiskLevel::Moderate => theme.status.warning,
+                RiskLevel::Elevated => theme.status.error,
+                RiskLevel::Unknown => theme.ui.secondary_text,
+            };
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Risk:")
+                        .font(FontId::proportional(10.0))
+                        .color(theme.ui.secondary_text),
+                );
+                ui.label(
+                    RichText::new(overview.summary.risk_level.label())
+                        .font(FontId::monospace(11.0))
+                        .color(risk_color)
+                        .strong(),
+                );
+                ui.label(
+                    RichText::new(overview.summary.risk_level.description())
+                        .font(FontId::proportional(10.0))
+                        .color(theme.ui.secondary_text),
+                );
+            });
+
+            // Summary counts
+            ui.horizontal(|ui| {
+                exposure_stat(ui, theme, "Total", overview.summary.total_listeners, theme.ui.text);
+                ui.separator();
+                exposure_stat(
+                    ui,
+                    theme,
+                    "TCP",
+                    overview.summary.tcp_listeners,
+                    theme.ui.accent,
+                );
+                ui.separator();
+                exposure_stat(
+                    ui,
+                    theme,
+                    "UDP",
+                    overview.summary.udp_listeners,
+                    theme.ui.accent,
+                );
+                ui.separator();
+                exposure_stat(
+                    ui,
+                    theme,
+                    "Loopback",
+                    overview.summary.loopback_listeners,
+                    theme.status.success,
+                );
+                ui.separator();
+                exposure_stat(
+                    ui,
+                    theme,
+                    "Non-loopback",
+                    overview.summary.non_loopback_listeners,
+                    theme.status.warning,
+                );
+                ui.separator();
+                exposure_stat(
+                    ui,
+                    theme,
+                    "All-iface",
+                    overview.summary.all_interface_listeners,
+                    theme.status.error,
+                );
+            });
+
+            // Firewall context
+            ui.label(
+                RichText::new(&overview.firewall_message)
+                    .font(FontId::proportional(10.0))
+                    .color(theme.ui.secondary_text),
+            );
+            ui.label(
+                RichText::new(
+                    "Exposure classification describes socket binding only; it does not prove internet accessibility.",
+                )
+                .font(FontId::proportional(9.0))
+                .color(theme.ui.secondary_text),
+            );
+            ui.label(
+                RichText::new(
+                    "External reachability cannot be determined without network probing.",
+                )
+                .font(FontId::proportional(9.0))
+                .color(theme.ui.secondary_text),
+            );
+
+            // Filters row
+            ui.horizontal(|ui| {
+                // Protocol filter
+                ui.label(
+                    RichText::new("Protocol:")
+                        .font(FontId::proportional(10.0))
+                        .color(theme.ui.secondary_text),
+                );
+                let proto_label = filter
+                    .protocol
+                    .map(|p| p.label())
+                    .unwrap_or("All")
+                    .to_string();
+                egui::ComboBox::from_id_salt("exp-proto-filter")
+                    .selected_text(proto_label)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(filter.protocol.is_none(), "All")
+                            .clicked()
+                        {
+                            filter.protocol = None;
+                        }
+                        if ui
+                            .selectable_label(filter.protocol == Some(crate::section::networking::connections::Protocol::Tcp), "TCP")
+                            .clicked()
+                        {
+                            filter.protocol = Some(crate::section::networking::connections::Protocol::Tcp);
+                        }
+                        if ui
+                            .selectable_label(filter.protocol == Some(crate::section::networking::connections::Protocol::Udp), "UDP")
+                            .clicked()
+                        {
+                            filter.protocol = Some(crate::section::networking::connections::Protocol::Udp);
+                        }
+                    });
+
+                // Exposure filter
+                ui.label(
+                    RichText::new("Exposure:")
+                        .font(FontId::proportional(10.0))
+                        .color(theme.ui.secondary_text),
+                );
+                let exp_label = filter
+                    .exposure
+                    .map(|e| e.label())
+                    .unwrap_or("All")
+                    .to_string();
+                egui::ComboBox::from_id_salt("exp-exposure-filter")
+                    .selected_text(exp_label)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(filter.exposure.is_none(), "All")
+                            .clicked()
+                        {
+                            filter.exposure = None;
+                        }
+                        for &e in &ExposureScope::ALL {
+                            if ui
+                                .selectable_label(filter.exposure == Some(e), e.label())
+                                .clicked()
+                            {
+                                filter.exposure = Some(e);
+                            }
+                        }
+                    });
+
+                // State filter
+                ui.label(
+                    RichText::new("State:")
+                        .font(FontId::proportional(10.0))
+                        .color(theme.ui.secondary_text),
+                );
+                let state_label = filter.state_filter.label().to_string();
+                egui::ComboBox::from_id_salt("exp-state-filter")
+                    .selected_text(state_label)
+                    .show_ui(ui, |ui| {
+                        for &s in &ListenerStateFilter::ALL {
+                            if ui
+                                .selectable_label(filter.state_filter == s, s.label())
+                                .clicked()
+                            {
+                                filter.state_filter = s;
+                            }
+                        }
+                    });
+            });
+
+            // Search box
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Search:")
+                        .font(FontId::proportional(10.0))
+                        .color(theme.ui.secondary_text),
+                );
+                let mut search = filter.search.clone();
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut search)
+                        .hint_text("Search listeners...")
+                        .desired_width(200.0)
+                        .font(FontId::proportional(11.0)),
+                );
+                if response.changed() {
+                    filter.search = search;
+                }
+                if !filter.search.is_empty()
+                    && ui
+                        .button(
+                            RichText::new("×")
+                                .font(FontId::proportional(11.0))
+                                .color(theme.ui.secondary_text),
+                        )
+                        .clicked()
+                {
+                    filter.search.clear();
+                    response.request_focus();
+                }
+            });
+
+            ui.separator();
+
+            // Listener table
+            let filtered_indices = overview.filter(&filter);
+            let filtered_count = filtered_indices.len();
+
+            if filtered_count == 0 {
+                if overview.listeners.is_empty() {
+                    ui.label(
+                        RichText::new("No listening services detected")
+                            .font(FontId::proportional(11.0))
+                            .color(theme.ui.secondary_text),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new("No listeners match the current filters.")
+                            .font(FontId::proportional(11.0))
+                            .color(theme.ui.secondary_text),
+                    );
+                }
+            } else {
+                // Table header
+                Frame::new()
+                    .fill(with_alpha(theme.ui.secondary_text, 0.08))
+                    .corner_radius(4.0)
+                    .inner_margin(Margin::symmetric(8, 4))
+                    .show(ui, |ui| {
+                        ui.columns(5, |cols| {
+                            header_cell(&mut cols[0], theme, "Proto", 40.0);
+                            header_cell(&mut cols[1], theme, "Address", 120.0);
+                            header_cell(&mut cols[2], theme, "Port", 50.0);
+                            header_cell(&mut cols[3], theme, "State", 60.0);
+                            header_cell(&mut cols[4], theme, "Exposure", 80.0);
+                        });
+                    });
+
+                // Listener rows
+                let display_count = filtered_count.min(MAX_RENDERED_EVENTS);
+                let display_indices = &filtered_indices[..display_count];
+
+                egui::ScrollArea::vertical()
+                    .id_salt("exposure-table-scroll")
+                    .max_height(200.0)
+                    .show_rows(ui, 20.0, display_count, |ui, row_range| {
+                        for &idx in &display_indices[row_range] {
+                            if let Some(listener) = overview.get(idx) {
+                                let is_selected = selected_index == Some(idx);
+                                let bg = if is_selected {
+                                    with_alpha(theme.ui.accent, 0.15)
+                                } else {
+                                    Color32::TRANSPARENT
+                                };
+
+                                Frame::new()
+                                    .fill(bg)
+                                    .corner_radius(4.0)
+                                    .inner_margin(Margin::symmetric(8, 4))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            // Protocol
+                                            ui.label(
+                                                RichText::new(listener.protocol.label())
+                                                    .font(FontId::monospace(10.0))
+                                                    .color(theme.ui.accent)
+                                                    .strong(),
+                                            );
+                                            // Address
+                                            ui.label(
+                                                RichText::new(&listener.local_addr)
+                                                    .font(FontId::monospace(10.0))
+                                                    .color(theme.ui.text),
+                                            );
+                                            // Port
+                                            ui.label(
+                                                RichText::new(listener.local_port.to_string())
+                                                    .font(FontId::monospace(10.0))
+                                                    .color(theme.ui.text),
+                                            );
+                                            // State
+                                            ui.label(
+                                                RichText::new(listener.state.label())
+                                                    .font(FontId::proportional(10.0))
+                                                    .color(theme.ui.secondary_text),
+                                            );
+                                            // Exposure
+                                            let exp_color = match listener.exposure {
+                                                ExposureScope::Loopback => theme.status.success,
+                                                ExposureScope::Local => theme.ui.accent,
+                                                ExposureScope::AllInterfaces => theme.status.error,
+                                                ExposureScope::Unknown => theme.ui.secondary_text,
+                                            };
+                                            ui.label(
+                                                RichText::new(listener.exposure.label())
+                                                    .font(FontId::proportional(10.0))
+                                                    .color(exp_color),
+                                            );
+                                        });
+
+                                        // Click to select
+                                        let response = ui.interact(
+                                            ui.max_rect(),
+                                            egui::Id::new(("exposure_row", idx)),
+                                            egui::Sense::click(),
+                                        );
+                                        if response.clicked() {
+                                            selected_index = if selected_index == Some(idx) {
+                                                None
+                                            } else {
+                                                Some(idx)
+                                            };
+                                        }
+                                    });
+                            }
+                        }
+                    });
+
+                if filtered_count > MAX_RENDERED_EVENTS {
+                    ui.label(
+                        RichText::new(format!(
+                            "Showing {} of {} listeners",
+                            MAX_RENDERED_EVENTS, filtered_count
+                        ))
+                        .font(FontId::proportional(10.0))
+                        .color(theme.ui.secondary_text),
+                    );
+                }
+            }
+
+            // Detail panel
+            if let Some(idx) = selected_index {
+                if let Some(listener) = overview.get(idx) {
+                    ui.separator();
+                    listener_detail_panel(ui, theme, listener);
+                }
+            }
+        });
+
+    // Persist filter and selection
+    ui.memory_mut(|m| {
+        m.data
+            .insert_persisted(egui::Id::new("cybersec_exposure_filter"), filter);
+        m.data
+            .insert_persisted(egui::Id::new("cybersec_exposure_sel"), selected_index);
+    });
+}
+
+fn exposure_stat(ui: &mut Ui, theme: &Theme, label: &str, value: u32, color: Color32) {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(label)
+                .font(FontId::proportional(9.0))
+                .color(theme.ui.secondary_text),
+        );
+        ui.label(
+            RichText::new(value.to_string())
+                .font(FontId::monospace(11.0))
+                .color(color)
+                .strong(),
+        );
+    });
+}
+
+fn listener_detail_panel(
+    ui: &mut Ui,
+    theme: &Theme,
+    listener: &super::exposure_overview::Listener,
+) {
+    let exp_color = match listener.exposure {
+        ExposureScope::Loopback => theme.status.success,
+        ExposureScope::Local => theme.ui.accent,
+        ExposureScope::AllInterfaces => theme.status.error,
+        ExposureScope::Unknown => theme.ui.secondary_text,
+    };
+
+    Frame::new()
+        .fill(with_alpha(theme.ui.accent, 0.08))
+        .corner_radius(6.0)
+        .inner_margin(Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new("Listener Details")
+                    .font(FontId::proportional(11.0))
+                    .color(theme.ui.text)
+                    .strong(),
+            );
+
+            Grid::new("exposure-detail-grid")
+                .num_columns(2)
+                .spacing(egui::vec2(12.0, 3.0))
+                .min_col_width(80.0)
+                .show(ui, |ui| {
+                    detail_label(ui, theme, "Protocol");
+                    ui.label(
+                        RichText::new(listener.protocol.label())
+                            .font(FontId::monospace(10.0))
+                            .color(theme.ui.accent),
+                    );
+                    ui.end_row();
+
+                    detail_label(ui, theme, "Address");
+                    ui.label(
+                        RichText::new(&listener.local_addr)
+                            .font(FontId::monospace(10.0))
+                            .color(theme.ui.text),
+                    );
+                    ui.end_row();
+
+                    detail_label(ui, theme, "Port");
+                    ui.label(
+                        RichText::new(listener.local_port.to_string())
+                            .font(FontId::monospace(10.0))
+                            .color(theme.ui.text),
+                    );
+                    ui.end_row();
+
+                    detail_label(ui, theme, "State");
+                    ui.label(
+                        RichText::new(listener.state.label())
+                            .font(FontId::proportional(10.0))
+                            .color(theme.ui.secondary_text),
+                    );
+                    ui.end_row();
+
+                    detail_label(ui, theme, "Family");
+                    ui.label(
+                        RichText::new(&listener.address_family)
+                            .font(FontId::proportional(10.0))
+                            .color(theme.ui.text),
+                    );
+                    ui.end_row();
+
+                    detail_label(ui, theme, "Exposure");
+                    ui.label(
+                        RichText::new(listener.exposure.label())
+                            .font(FontId::proportional(10.0))
+                            .color(exp_color)
+                            .strong(),
+                    );
+                    ui.end_row();
+
+                    detail_label(ui, theme, "Explanation");
+                    ui.label(
+                        RichText::new(&listener.explanation)
+                            .font(FontId::proportional(10.0))
+                            .color(theme.ui.text),
+                    );
+                    ui.end_row();
+
+                    if let Some(ref name) = listener.process_name {
+                        detail_label(ui, theme, "Process");
+                        ui.label(
+                            RichText::new(name)
+                                .font(FontId::monospace(10.0))
+                                .color(theme.ui.text),
+                        );
+                        ui.end_row();
+                    }
+                    if let Some(pid) = listener.process_pid {
+                        detail_label(ui, theme, "PID");
+                        ui.label(
+                            RichText::new(pid.to_string())
+                                .font(FontId::monospace(10.0))
+                                .color(theme.ui.text),
+                        );
+                        ui.end_row();
+                    }
+
+                    if listener.process_name.is_none() {
+                        detail_label(ui, theme, "Process");
+                        ui.label(
+                            RichText::new("Process unavailable")
+                                .font(FontId::proportional(10.0))
+                                .color(theme.ui.secondary_text),
+                        );
+                        ui.end_row();
+                    }
                 });
         });
 }
