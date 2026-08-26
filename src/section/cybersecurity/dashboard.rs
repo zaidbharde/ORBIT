@@ -1,9 +1,11 @@
 //! Themed dashboard rendering for the Cybersecurity section.
 //!
-//! Pure presentation: reads cached [`SecuritySnapshot`] values and paints
-//! themed cards. Data is collected by the section's update loop, never here.
+//! Pure presentation: reads cached [`SecuritySnapshot`] and [`EventLog`]
+//! values and paints themed cards. Data is collected by the section's update
+//! loop, never here.
 
 use super::security_data::SecuritySnapshot;
+use super::security_events::{EventCategory, EventFilter, EventLog, Severity};
 use crate::glass::with_alpha;
 use crate::section::SectionContext;
 use crate::theme::Theme;
@@ -11,18 +13,26 @@ use eframe::egui;
 use eframe::egui::{Color32, FontId, Frame, Grid, Margin, RichText, Stroke, Ui};
 use std::time::SystemTime;
 
+/// Maximum number of event rows to render.
+const MAX_RENDERED_EVENTS: usize = 100;
+
 /// Render the full Security Overview dashboard.
-pub fn show(ui: &mut Ui, context: &SectionContext<'_>, snapshot: &SecuritySnapshot) {
-    let _theme = context.theme;
+pub fn show(
+    ui: &mut Ui,
+    context: &SectionContext<'_>,
+    snapshot: &SecuritySnapshot,
+    event_log: &EventLog,
+) {
     ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
 
-    summary_card(ui, context, &snapshot.summary);
+    summary_card(ui, context, &snapshot.summary, event_log);
     last_updated_row(ui, context, snapshot.last_updated);
     user_session_card(ui, context, &snapshot.user_session);
     privilege_card(ui, context, &snapshot.privilege);
     firewall_card(ui, context, &snapshot.firewall);
     kernel_settings_card(ui, context, &snapshot.kernel_settings);
     auth_summary_card(ui, context, &snapshot.auth_summary);
+    security_events_card(ui, context, event_log);
 }
 
 // ---------------------------------------------------------------------------
@@ -89,6 +99,7 @@ fn summary_card(
     ui: &mut Ui,
     context: &SectionContext<'_>,
     summary: &super::security_data::SecuritySummary,
+    event_log: &EventLog,
 ) {
     let theme = context.theme;
     let appearance = context.appearance;
@@ -138,6 +149,8 @@ fn summary_card(
                 summary.unavailable,
                 theme.ui.secondary_text,
             );
+            ui.separator();
+            summary_stat(ui, theme, "Events", event_log.len() as u32, theme.ui.accent);
         });
     });
 }
@@ -472,6 +485,381 @@ fn auth_summary_card(
                 detail_row(ui, theme, "Latest Event", auth.latest_event_time.as_deref());
             });
     });
+}
+
+// ---------------------------------------------------------------------------
+// Security Events card
+// ---------------------------------------------------------------------------
+
+fn security_events_card(ui: &mut Ui, context: &SectionContext<'_>, event_log: &EventLog) {
+    let theme = context.theme;
+    let panel_fill = context.panel_fill;
+    let appearance = context.appearance;
+    let border_stroke = if appearance.border_width > 0.0 {
+        Stroke::new(
+            appearance.border_width.clamp(0.0, 4.0),
+            with_alpha(theme.ui.border, appearance.border_opacity),
+        )
+    } else {
+        Stroke::NONE
+    };
+    let corner_radius = appearance.panel_radius.clamp(0.0, 16.0);
+
+    // Event state (stored in memory via memory, no persistence)
+    let (mut filter, mut selected_index) = {
+        let mem = ui.memory_mut(|m| {
+            let filter = m
+                .data
+                .get_persisted::<EventFilter>(egui::Id::new("cybersec_event_filter"))
+                .unwrap_or_default();
+            let sel = m
+                .data
+                .get_persisted::<Option<usize>>(egui::Id::new("cybersec_event_sel"));
+            (filter, sel)
+        });
+        (mem.0, mem.1.flatten())
+    };
+
+    Frame::new()
+        .fill(panel_fill)
+        .inner_margin(Margin::symmetric(12, 10))
+        .corner_radius(corner_radius)
+        .stroke(border_stroke)
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 6.0;
+
+            // Title row
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Security Events")
+                        .font(FontId::proportional(13.0))
+                        .color(theme.ui.text)
+                        .strong(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(format!("{} total", event_log.len()))
+                            .font(FontId::proportional(10.0))
+                            .color(theme.ui.secondary_text),
+                    );
+                });
+            });
+
+            // Filters row
+            ui.horizontal(|ui| {
+                // Severity filter
+                ui.label(
+                    RichText::new("Severity:")
+                        .font(FontId::proportional(10.0))
+                        .color(theme.ui.secondary_text),
+                );
+                let sev_label = filter
+                    .severity
+                    .map(|s| s.label())
+                    .unwrap_or("All")
+                    .to_string();
+                egui::ComboBox::from_id_salt("sev-filter")
+                    .selected_text(sev_label)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(filter.severity.is_none(), "All")
+                            .clicked()
+                        {
+                            filter.severity = None;
+                        }
+                        for &sev in &Severity::ALL {
+                            if ui
+                                .selectable_label(filter.severity == Some(sev), sev.label())
+                                .clicked()
+                            {
+                                filter.severity = Some(sev);
+                            }
+                        }
+                    });
+
+                // Category filter
+                ui.label(
+                    RichText::new("Category:")
+                        .font(FontId::proportional(10.0))
+                        .color(theme.ui.secondary_text),
+                );
+                let cat_label = filter
+                    .category
+                    .map(|c| c.label())
+                    .unwrap_or("All")
+                    .to_string();
+                egui::ComboBox::from_id_salt("cat-filter")
+                    .selected_text(cat_label)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(filter.category.is_none(), "All")
+                            .clicked()
+                        {
+                            filter.category = None;
+                        }
+                        for &cat in &EventCategory::ALL {
+                            if ui
+                                .selectable_label(filter.category == Some(cat), cat.label())
+                                .clicked()
+                            {
+                                filter.category = Some(cat);
+                            }
+                        }
+                    });
+            });
+
+            // Search box
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Search:")
+                        .font(FontId::proportional(10.0))
+                        .color(theme.ui.secondary_text),
+                );
+                let mut search = filter.search.clone();
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut search)
+                        .hint_text("Filter events...")
+                        .desired_width(200.0)
+                        .font(FontId::proportional(11.0)),
+                );
+                if response.changed() {
+                    filter.search = search;
+                }
+                // Clear button
+                if !filter.search.is_empty()
+                    && ui
+                        .button(
+                            RichText::new("×")
+                                .font(FontId::proportional(11.0))
+                                .color(theme.ui.secondary_text),
+                        )
+                        .clicked()
+                {
+                    filter.search.clear();
+                    response.request_focus();
+                }
+            });
+
+            ui.separator();
+
+            // Event table
+            let filtered_indices = event_log.filter(&filter);
+            let filtered_count = filtered_indices.len();
+
+            if filtered_count == 0 {
+                ui.label(
+                    RichText::new("No events match the current filters.")
+                        .font(FontId::proportional(11.0))
+                        .color(theme.ui.secondary_text),
+                );
+            } else {
+                // Table header
+                Frame::new()
+                    .fill(with_alpha(theme.ui.secondary_text, 0.08))
+                    .corner_radius(4.0)
+                    .inner_margin(Margin::symmetric(8, 4))
+                    .show(ui, |ui| {
+                        ui.columns(4, |cols| {
+                            header_cell(&mut cols[0], theme, "Time", 80.0);
+                            header_cell(&mut cols[1], theme, "Sev", 40.0);
+                            header_cell(&mut cols[2], theme, "Category", 60.0);
+                            header_cell(&mut cols[3], theme, "Summary", 200.0);
+                        });
+                    });
+
+                // Event rows (max rendered)
+                let display_count = filtered_count.min(MAX_RENDERED_EVENTS);
+                let display_indices = &filtered_indices[..display_count];
+
+                egui::ScrollArea::vertical()
+                    .id_salt("event-table-scroll")
+                    .max_height(200.0)
+                    .show_rows(ui, 20.0, display_count, |ui, row_range| {
+                        for &idx in &display_indices[row_range] {
+                            if let Some(event) = event_log.get(idx) {
+                                let is_selected = selected_index == Some(idx);
+                                let bg = if is_selected {
+                                    with_alpha(theme.ui.accent, 0.15)
+                                } else {
+                                    Color32::TRANSPARENT
+                                };
+
+                                Frame::new()
+                                    .fill(bg)
+                                    .corner_radius(4.0)
+                                    .inner_margin(Margin::symmetric(8, 4))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            // Time
+                                            ui.label(
+                                                RichText::new(&event.timestamp)
+                                                    .font(FontId::proportional(10.0))
+                                                    .color(theme.ui.secondary_text),
+                                            );
+                                            // Severity badge
+                                            let sev_color = match event.severity {
+                                                Severity::Info => theme.status.success,
+                                                Severity::Warning => theme.status.warning,
+                                                Severity::Error => theme.status.error,
+                                            };
+                                            ui.label(
+                                                RichText::new(event.severity.label())
+                                                    .font(FontId::proportional(10.0))
+                                                    .color(sev_color)
+                                                    .strong(),
+                                            );
+                                            // Category badge
+                                            ui.label(
+                                                RichText::new(event.category.label())
+                                                    .font(FontId::proportional(10.0))
+                                                    .color(theme.ui.accent),
+                                            );
+                                            // Source
+                                            ui.label(
+                                                RichText::new(&event.source)
+                                                    .font(FontId::proportional(10.0))
+                                                    .color(theme.ui.secondary_text),
+                                            );
+                                            // Summary
+                                            ui.label(
+                                                RichText::new(&event.summary)
+                                                    .font(FontId::proportional(10.0))
+                                                    .color(theme.ui.text),
+                                            );
+                                        });
+
+                                        // Click to select
+                                        let response = ui.interact(
+                                            ui.max_rect(),
+                                            egui::Id::new(("event_row", idx)),
+                                            egui::Sense::click(),
+                                        );
+                                        if response.clicked() {
+                                            selected_index = if selected_index == Some(idx) {
+                                                None
+                                            } else {
+                                                Some(idx)
+                                            };
+                                        }
+                                    });
+                            }
+                        }
+                    });
+
+                if filtered_count > MAX_RENDERED_EVENTS {
+                    ui.label(
+                        RichText::new(format!(
+                            "Showing {} of {} events",
+                            MAX_RENDERED_EVENTS, filtered_count
+                        ))
+                        .font(FontId::proportional(10.0))
+                        .color(theme.ui.secondary_text),
+                    );
+                }
+            }
+
+            // Event detail panel
+            if let Some(idx) = selected_index {
+                if let Some(event) = event_log.get(idx) {
+                    ui.separator();
+                    event_detail_panel(ui, theme, event);
+                }
+            }
+        });
+
+    // Persist filter and selection
+    ui.memory_mut(|m| {
+        m.data
+            .insert_persisted(egui::Id::new("cybersec_event_filter"), filter);
+        m.data
+            .insert_persisted(egui::Id::new("cybersec_event_sel"), selected_index);
+    });
+}
+
+fn header_cell(ui: &mut Ui, theme: &Theme, label: &str, width: f32) {
+    ui.set_min_width(width);
+    ui.label(
+        RichText::new(label)
+            .font(FontId::proportional(10.0))
+            .color(theme.ui.secondary_text)
+            .strong(),
+    );
+}
+
+fn event_detail_panel(ui: &mut Ui, theme: &Theme, event: &super::security_events::SecurityEvent) {
+    let sev_color = match event.severity {
+        Severity::Info => theme.status.success,
+        Severity::Warning => theme.status.warning,
+        Severity::Error => theme.status.error,
+    };
+
+    Frame::new()
+        .fill(with_alpha(theme.ui.accent, 0.08))
+        .corner_radius(6.0)
+        .inner_margin(Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new("Event Details")
+                    .font(FontId::proportional(11.0))
+                    .color(theme.ui.text)
+                    .strong(),
+            );
+
+            Grid::new("event-detail-grid")
+                .num_columns(2)
+                .spacing(egui::vec2(12.0, 3.0))
+                .min_col_width(80.0)
+                .show(ui, |ui| {
+                    detail_label(ui, theme, "Timestamp");
+                    ui.label(
+                        RichText::new(&event.timestamp)
+                            .font(FontId::proportional(10.0))
+                            .color(theme.ui.text),
+                    );
+                    ui.end_row();
+
+                    detail_label(ui, theme, "Severity");
+                    ui.label(
+                        RichText::new(event.severity.label())
+                            .font(FontId::proportional(10.0))
+                            .color(sev_color)
+                            .strong(),
+                    );
+                    ui.end_row();
+
+                    detail_label(ui, theme, "Category");
+                    ui.label(
+                        RichText::new(event.category.label())
+                            .font(FontId::proportional(10.0))
+                            .color(theme.ui.accent),
+                    );
+                    ui.end_row();
+
+                    detail_label(ui, theme, "Source");
+                    ui.label(
+                        RichText::new(&event.source)
+                            .font(FontId::proportional(10.0))
+                            .color(theme.ui.text),
+                    );
+                    ui.end_row();
+
+                    detail_label(ui, theme, "Summary");
+                    ui.label(
+                        RichText::new(&event.summary)
+                            .font(FontId::proportional(10.0))
+                            .color(theme.ui.text),
+                    );
+                    ui.end_row();
+                });
+        });
+}
+
+fn detail_label(ui: &mut Ui, theme: &Theme, label: &str) {
+    ui.label(
+        RichText::new(label)
+            .font(FontId::proportional(10.0))
+            .color(theme.ui.secondary_text),
+    );
 }
 
 // ---------------------------------------------------------------------------

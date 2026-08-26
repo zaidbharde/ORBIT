@@ -1,4 +1,5 @@
-//! Cybersecurity section: read-only local security posture overview.
+//! Cybersecurity section: read-only local security posture overview
+//! and security event monitoring.
 //!
 //! Collects security-relevant information from Linux procfs, sysfs and
 //! safe local files once per ~1 Hz cycle. Rendering reads cached values only.
@@ -6,6 +7,7 @@
 
 pub mod dashboard;
 pub mod security_data;
+pub mod security_events;
 
 use super::{Section, SectionContext, SectionId};
 use crate::theme::Theme;
@@ -18,6 +20,7 @@ const COLLECT_INTERVAL: Duration = Duration::from_secs(1);
 /// The live Cybersecurity dashboard section.
 pub struct CybersecuritySection {
     snapshot: security_data::SecuritySnapshot,
+    event_log: security_events::EventLog,
     last_collect: Option<Instant>,
 }
 
@@ -25,12 +28,14 @@ impl CybersecuritySection {
     pub fn new() -> Self {
         Self {
             snapshot: security_data::SecuritySnapshot::default(),
+            event_log: security_events::EventLog::default(),
             last_collect: None,
         }
     }
 
     fn collect(&mut self) {
         self.snapshot = security_data::SecuritySnapshot::collect();
+        self.event_log = security_events::collect_events(&self.event_log);
     }
 }
 
@@ -53,11 +58,12 @@ impl Section for CybersecuritySection {
 
     fn render(&mut self, ui: &mut egui::Ui, context: &SectionContext<'_>) -> egui::Response {
         let snapshot = self.snapshot.clone();
+        let event_log = self.event_log.clone();
         egui::ScrollArea::vertical()
             .id_salt("cybersecurity-dashboard")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                dashboard::show(ui, context, &snapshot);
+                dashboard::show(ui, context, &snapshot, &event_log);
                 ui.response()
             })
             .inner
@@ -65,13 +71,24 @@ impl Section for CybersecuritySection {
 
     fn status_label(&self, theme: &Theme) -> Option<(String, egui::Color32)> {
         let warnings = self.snapshot.summary.warnings;
+        let events = self.event_log.len();
         if warnings > 0 {
             Some((
-                format!("{warnings} warning{}", if warnings == 1 { "" } else { "s" }),
+                format!(
+                    "{warnings} warning{} · {events} event{}",
+                    if warnings == 1 { "" } else { "s" },
+                    if events == 1 { "" } else { "s" }
+                ),
                 theme.status.warning,
             ))
         } else {
-            Some(("secure".into(), theme.status.success))
+            Some((
+                format!(
+                    "secure · {events} event{}",
+                    if events == 1 { "" } else { "s" }
+                ),
+                theme.status.success,
+            ))
         }
     }
 }
@@ -91,6 +108,7 @@ mod tests {
         let section = CybersecuritySection::new();
         assert_eq!(section.snapshot.summary.checks_available, 0);
         assert!(section.snapshot.last_updated.is_none());
+        assert!(section.event_log.is_empty());
     }
 
     #[test]
