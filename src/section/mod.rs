@@ -1,4 +1,5 @@
 pub mod cybersecurity;
+pub mod devops;
 pub mod networking;
 pub mod placeholder;
 pub mod registry;
