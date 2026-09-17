@@ -1,9 +1,11 @@
 //! DevOps section: read-only environment overview for development and
 //! operations toolchain detection.
 //!
-//! Checks for Git, Rust toolchain, Docker and Podman by probing PATH and
-//! running fixed, minimal version commands. All operations are strictly
-//! read-only — no containers are started, images pulled, or state modified.
+//! Checks for Git, Rust toolchain, Node.js, Python and container tools by probing
+//! PATH and running fixed, minimal version commands. Also inspects the current
+//! project environment (OS, kernel, architecture, working directory).
+//! All operations are strictly read-only — no packages are installed, no
+//! repositories modified, no containers created or deleted.
 
 pub mod dashboard;
 pub mod tool_detection;
@@ -18,7 +20,7 @@ use std::time::{Duration, Instant};
 /// How often tool data is re-collected (1 Hz).
 const COLLECT_INTERVAL: Duration = Duration::from_secs(1);
 
-/// The live DevOps Environment Overview section.
+/// The live DevOps Toolchain & Project Environment Inspector section.
 pub struct DevOpsSection {
     snapshot: tool_detection::DevOpsSnapshot,
     last_collect: Option<Instant>,
@@ -162,7 +164,8 @@ mod tests {
     fn collect_populates_snapshot() {
         let mut section = DevOpsSection::new();
         section.collect();
-        assert_eq!(section.snapshot.tools.len(), 5);
+        // 9 tools: git, rustc, cargo, node, npm, python3, pip, docker, podman
+        assert_eq!(section.snapshot.tools.len(), 9);
         assert!(section.snapshot.last_updated.is_some());
     }
 
@@ -203,5 +206,21 @@ mod tests {
         section.collect();
         let count2 = section.snapshot.tools.len();
         assert_eq!(count1, count2);
+    }
+
+    #[test]
+    fn collect_populates_project_env() {
+        let mut section = DevOpsSection::new();
+        section.collect();
+        assert!(section.snapshot.project_env.working_dir.is_some());
+        assert!(section.snapshot.project_env.architecture.is_some());
+    }
+
+    #[test]
+    fn collect_populates_git_repo() {
+        let mut section = DevOpsSection::new();
+        section.collect();
+        // May or may not be in a git repo
+        let _ = section.snapshot.git_repo.in_repo;
     }
 }
